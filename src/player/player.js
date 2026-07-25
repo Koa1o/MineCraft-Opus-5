@@ -35,6 +35,8 @@ const PLAYER_STEP_HEIGHT = 0.6;
 const PLAYER_GRAVITY = 0.08;
 const PLAYER_AIR_FRICTION = 0.91;
 const PLAYER_GROUND_FRICTION = 0.6;
+/** Fraction of ground acceleration available while airborne. */
+const PLAYER_AIR_CONTROL = 0.22;
 
 const PLAYER_EXHAUSTION_WALK = 0.01;
 const PLAYER_EXHAUSTION_SPRINT = 0.1;
@@ -118,6 +120,12 @@ function PLAYER_totalXpToLevel(lvl) {
 // ---------------------------------------------------------------------------
 // Player
 // ---------------------------------------------------------------------------
+
+/** Neutral input, used when the player has no controller attached. */
+const PLAYER_NO_INPUT = Object.freeze({
+  forward: false, back: false, left: false, right: false,
+  jump: false, sneak: false, sprint: false, attack: false, use: false,
+});
 
 export class Player extends Entity {
   constructor(def) {
@@ -811,14 +819,29 @@ export class Player extends Entity {
     const mlen = Math.sqrt(mx * mx + mz * mz);
     if (mlen > 1e-6) { mx /= mlen; mz /= mlen; }
 
-    // Air control is reduced
-    const accel = this.onGround ? 0.1 : 0.02;
+    // Horizontal acceleration.
+    //
+    // Friction is applied multiplicatively every tick (see below), so the speed
+    // settles where acceleration balances the loss:
+    //     v_final = a * f / (1 - f)
+    // Picking `a` as a small fraction of the target speed therefore does NOT
+    // reach that speed — with a = 0.1 * walk and f = 0.546 the player topped out
+    // at 0.52 blocks/s instead of 4.32, i.e. 8x too slow, which reads as being
+    // unable to move at all. Solve for the acceleration that actually lands on
+    // baseSpeed, and keep reduced authority while airborne.
+    const groundFric = PLAYER_AIR_FRICTION * slipperiness;
     if (this.isFlying) {
       this.vel.x += mx * baseSpeed * 0.2;
       this.vel.z += mz * baseSpeed * 0.2;
+    } else if (this.onGround) {
+      const a = baseSpeed * (1 - groundFric) / Math.max(0.05, groundFric);
+      this.vel.x += mx * a;
+      this.vel.z += mz * a;
     } else {
-      this.vel.x += mx * baseSpeed * accel;
-      this.vel.z += mz * baseSpeed * accel;
+      // In air: same target, but only a fraction of the control authority.
+      const a = baseSpeed * (1 - PLAYER_AIR_FRICTION) / Math.max(0.05, PLAYER_AIR_FRICTION);
+      this.vel.x += mx * a * PLAYER_AIR_CONTROL;
+      this.vel.z += mz * a * PLAYER_AIR_CONTROL;
     }
 
     // Climbing
@@ -1097,6 +1120,37 @@ export class Player extends Entity {
     const dmg = Math.floor(fd - 3);
     if (dmg > 0) {
       this.damage(dmg, { type: 'fall' }, world);
+    }
+  }
+
+  /**
+   * One 20Hz gameplay tick for the player: physics from the current input,
+   * survival stats, and the per-tick timers.
+   *
+   * World._tickEntities() deliberately skips entities of type 'player' ("ticked
+   * by their controller"), so this MUST be driven from the game loop. It was not
+   * wired up at all, which meant updatePhysics() never ran and the player could
+   * not move, fall, swim or take damage.
+   *
+   * @param {object} world
+   * @param {object} input {forward,back,left,right,jump,sneak,sprint}
+   * @param {object} registry block registry
+   */
+  tick(world, input, registry) {
+    if (this.removed) return;
+    // prevPos drives render interpolation between ticks.
+    this.prevPos.x = this.pos.x;
+    this.prevPos.y = this.pos.y;
+    this.prevPos.z = this.pos.z;
+
+    this.age++;
+    if (this.hurtTime > 0) this.hurtTime--;
+    if (this.invulnTicks > 0) this.invulnTicks--;
+    if (this.attackCooldown > 0) this.attackCooldown--;
+
+    if (!this.dead) {
+      this.updatePhysics(world, input || PLAYER_NO_INPUT, 1, registry);
+      this._tickSurvivalStats(world);
     }
   }
 

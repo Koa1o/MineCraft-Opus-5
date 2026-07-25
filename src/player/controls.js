@@ -282,8 +282,19 @@ export class PlayerControls {
     if (typeof document === 'undefined') return;
     this._paused = !document.pointerLockElement;
     if (this._paused) {
-      this._input = CTRL_DEFAULT_INPUT();
+      // Clear the input IN PLACE. Replacing the object would invalidate every
+      // reference handed out by the `input` getter (the game loop holds one), so
+      // the player would keep reading a detached, permanently-false object and
+      // could never move again after the first pointer-lock change.
+      this._clearInput();
     }
+  }
+
+  /** Reset all input flags without changing object identity. */
+  _clearInput() {
+    const fresh = CTRL_DEFAULT_INPUT();
+    for (const k of Object.keys(fresh)) this._input[k] = fresh[k];
+    this._keys = {};
   }
 
   _onKeyDown(e) {

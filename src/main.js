@@ -563,9 +563,29 @@ function MAIN_gameUpdate(game, dt) {
     camera.position.set(px, py + eyeH, pz);
   }
 
-  // Update world simulation
+  // Update world simulation. update() runs the fixed 20Hz ticks internally and
+  // returns how many it ran this frame.
+  let ticksRun = 0;
   if (world && player) {
-    world.update(dt, player.pos);
+    ticksRun = world.update(dt, player.pos) || 0;
+  }
+
+  // Tick the player on the SAME fixed timestep as the world.
+  // World._tickEntities() skips entities of type 'player' on purpose ("ticked by
+  // their controller"), so this is the only thing that advances player physics.
+  // Driving it per-frame instead would make movement speed depend on framerate.
+  if (world && player && game._registry) {
+    const input = (controls && controls.input) ? controls.input : null;
+    for (let t = 0; t < ticksRun; t++) {
+      try {
+        player.tick(world, input, game._registry);
+      } catch (err) {
+        if (!game._playerTickError) {
+          game._playerTickError = true;
+          console.error('[Game] player tick failed:', err);
+        }
+      }
+    }
   }
 
   // ---- upload changed chunk geometry to the GPU (budgeted) ----------------

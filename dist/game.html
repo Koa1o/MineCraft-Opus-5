@@ -66,7 +66,7 @@
 <div id="mc-boot">
   <h1>VOXELCRAFT</h1>
   <div class="sub">Opus 5 &middot; single-file build</div>
-  <div class="sub" style="margin-top:6px;opacity:.4;font-size:11px">build 822ed8ae-2026-07-25</div>
+  <div class="sub" style="margin-top:6px;opacity:.4;font-size:11px">build af4024c0-2026-07-25</div>
   <div id="mc-bar"><i></i></div>
   <div id="mc-status">initialising&hellip;</div>
   <button id="mc-play" style="display:none">Play</button>
@@ -30474,6 +30474,8 @@ const PLAYER_STEP_HEIGHT = 0.6;
 const PLAYER_GRAVITY = 0.08;
 const PLAYER_AIR_FRICTION = 0.91;
 const PLAYER_GROUND_FRICTION = 0.6;
+/** Fraction of ground acceleration available while airborne. */
+const PLAYER_AIR_CONTROL = 0.22;
 
 const PLAYER_EXHAUSTION_WALK = 0.01;
 const PLAYER_EXHAUSTION_SPRINT = 0.1;
@@ -30557,6 +30559,12 @@ function PLAYER_totalXpToLevel(lvl) {
 // ---------------------------------------------------------------------------
 // Player
 // ---------------------------------------------------------------------------
+
+/** Neutral input, used when the player has no controller attached. */
+const PLAYER_NO_INPUT = Object.freeze({
+  forward: false, back: false, left: false, right: false,
+  jump: false, sneak: false, sprint: false, attack: false, use: false,
+});
 
 class Player extends Entity {
   constructor(def) {
@@ -31250,14 +31258,29 @@ class Player extends Entity {
     const mlen = Math.sqrt(mx * mx + mz * mz);
     if (mlen > 1e-6) { mx /= mlen; mz /= mlen; }
 
-    // Air control is reduced
-    const accel = this.onGround ? 0.1 : 0.02;
+    // Horizontal acceleration.
+    //
+    // Friction is applied multiplicatively every tick (see below), so the speed
+    // settles where acceleration balances the loss:
+    //     v_final = a * f / (1 - f)
+    // Picking `a` as a small fraction of the target speed therefore does NOT
+    // reach that speed — with a = 0.1 * walk and f = 0.546 the player topped out
+    // at 0.52 blocks/s instead of 4.32, i.e. 8x too slow, which reads as being
+    // unable to move at all. Solve for the acceleration that actually lands on
+    // baseSpeed, and keep reduced authority while airborne.
+    const groundFric = PLAYER_AIR_FRICTION * slipperiness;
     if (this.isFlying) {
       this.vel.x += mx * baseSpeed * 0.2;
       this.vel.z += mz * baseSpeed * 0.2;
+    } else if (this.onGround) {
+      const a = baseSpeed * (1 - groundFric) / Math.max(0.05, groundFric);
+      this.vel.x += mx * a;
+      this.vel.z += mz * a;
     } else {
-      this.vel.x += mx * baseSpeed * accel;
-      this.vel.z += mz * baseSpeed * accel;
+      // In air: same target, but only a fraction of the control authority.
+      const a = baseSpeed * (1 - PLAYER_AIR_FRICTION) / Math.max(0.05, PLAYER_AIR_FRICTION);
+      this.vel.x += mx * a * PLAYER_AIR_CONTROL;
+      this.vel.z += mz * a * PLAYER_AIR_CONTROL;
     }
 
     // Climbing
@@ -31536,6 +31559,37 @@ class Player extends Entity {
     const dmg = Math.floor(fd - 3);
     if (dmg > 0) {
       this.damage(dmg, { type: 'fall' }, world);
+    }
+  }
+
+  /**
+   * One 20Hz gameplay tick for the player: physics from the current input,
+   * survival stats, and the per-tick timers.
+   *
+   * World._tickEntities() deliberately skips entities of type 'player' ("ticked
+   * by their controller"), so this MUST be driven from the game loop. It was not
+   * wired up at all, which meant updatePhysics() never ran and the player could
+   * not move, fall, swim or take damage.
+   *
+   * @param {object} world
+   * @param {object} input {forward,back,left,right,jump,sneak,sprint}
+   * @param {object} registry block registry
+   */
+  tick(world, input, registry) {
+    if (this.removed) return;
+    // prevPos drives render interpolation between ticks.
+    this.prevPos.x = this.pos.x;
+    this.prevPos.y = this.pos.y;
+    this.prevPos.z = this.pos.z;
+
+    this.age++;
+    if (this.hurtTime > 0) this.hurtTime--;
+    if (this.invulnTicks > 0) this.invulnTicks--;
+    if (this.attackCooldown > 0) this.attackCooldown--;
+
+    if (!this.dead) {
+      this.updatePhysics(world, input || PLAYER_NO_INPUT, 1, registry);
+      this._tickSurvivalStats(world);
     }
   }
 
@@ -31903,8 +31957,19 @@ class PlayerControls {
     if (typeof document === 'undefined') return;
     this._paused = !document.pointerLockElement;
     if (this._paused) {
-      this._input = CTRL_DEFAULT_INPUT();
+      // Clear the input IN PLACE. Replacing the object would invalidate every
+      // reference handed out by the `input` getter (the game loop holds one), so
+      // the player would keep reading a detached, permanently-false object and
+      // could never move again after the first pointer-lock change.
+      this._clearInput();
     }
+  }
+
+  /** Reset all input flags without changing object identity. */
+  _clearInput() {
+    const fresh = CTRL_DEFAULT_INPUT();
+    for (const k of Object.keys(fresh)) this._input[k] = fresh[k];
+    this._keys = {};
   }
 
   _onKeyDown(e) {
@@ -34174,9 +34239,29 @@ function MAIN_gameUpdate(game, dt) {
     camera.position.set(px, py + eyeH, pz);
   }
 
-  // Update world simulation
+  // Update world simulation. update() runs the fixed 20Hz ticks internally and
+  // returns how many it ran this frame.
+  let ticksRun = 0;
   if (world && player) {
-    world.update(dt, player.pos);
+    ticksRun = world.update(dt, player.pos) || 0;
+  }
+
+  // Tick the player on the SAME fixed timestep as the world.
+  // World._tickEntities() skips entities of type 'player' on purpose ("ticked by
+  // their controller"), so this is the only thing that advances player physics.
+  // Driving it per-frame instead would make movement speed depend on framerate.
+  if (world && player && game._registry) {
+    const input = (controls && controls.input) ? controls.input : null;
+    for (let t = 0; t < ticksRun; t++) {
+      try {
+        player.tick(world, input, game._registry);
+      } catch (err) {
+        if (!game._playerTickError) {
+          game._playerTickError = true;
+          console.error('[Game] player tick failed:', err);
+        }
+      }
+    }
   }
 
   // ---- upload changed chunk geometry to the GPU (budgeted) ----------------
