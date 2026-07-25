@@ -973,8 +973,16 @@ export class World {
     const pcz = WORLD_floorDiv(Math.floor(playerPos.z), CHUNK_W);
 
     // Rebuild the spiral offset list if render distance changed.
+    //
+    // The spiral covers rd + 2 rings, wider than the render distance. A chunk
+    // is only meshed once all 8 of its neighbours are generated and lit, so if
+    // the spiral stopped exactly at rd the outermost ring would wait forever on
+    // neighbours that are never created — chunks stalled at "generated but not
+    // meshed" and the visible world stopped growing (measured: stuck at 9 of 29).
+    // Two rings are needed, not one: the extra ring must itself be decorated,
+    // and decoration also requires its own 8 neighbours to be generated.
     if (this._loadOrderRD !== rd) {
-      this._loadOrder = WORLD_buildSpiral(rd);
+      this._loadOrder = WORLD_buildSpiral(rd + 2);
       this._loadOrderRD = rd;
     }
 

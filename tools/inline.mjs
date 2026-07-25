@@ -236,6 +236,7 @@ function buildHtml(bundle) {
 <div id="mc-boot">
   <h1>VOXELCRAFT</h1>
   <div class="sub">Opus 5 &middot; single-file build</div>
+  <div class="sub" style="margin-top:6px;opacity:.4;font-size:11px">build __DIST_BUILD_ID__</div>
   <div id="mc-bar"><i></i></div>
   <div id="mc-status">initialising&hellip;</div>
   <button id="mc-play" style="display:none">Play</button>
@@ -302,9 +303,36 @@ try {
 // main
 // ---------------------------------------------------------------------------
 
+/**
+ * Stamp a build id into index.html and dist/game.html.
+ *
+ * GitHub Pages caches aggressively, and a stale main.js keeps old shader code
+ * alive while the source on disk looks correct — which is genuinely hard to
+ * diagnose from the outside. The id is derived from the source itself, so it
+ * changes whenever the code does, appears on the splash screen, and is used as
+ * a cache-busting query on the module import.
+ */
+function stampBuildId(bundleSrc) {
+  const id = createHash('sha256').update(bundleSrc).digest('hex').slice(0, 8)
+    + '-' + new Date().toISOString().slice(0, 10);
+  const idxPath = resolve(ROOT, 'index.html');
+  if (existsSync(idxPath)) {
+    const cur = readFileSync(idxPath, 'utf8');
+    const next = cur.replace(/const MC_BUILD = '[^']*';/, `const MC_BUILD = '${id}';`);
+    if (next !== cur) {
+      writeFileSync(idxPath, next);
+      console.log('stamped index.html with build ' + id);
+    }
+  }
+  return id;
+}
+
 const check = process.argv.includes('--check');
 const { bundle, count } = buildBundle();
-const html = buildHtml(bundle);
+const buildId = check
+  ? (readFileSync(resolve(ROOT, 'index.html'), 'utf8').match(/const MC_BUILD = '([^']*)'/) || [, 'unknown'])[1]
+  : stampBuildId(bundle);
+const html = buildHtml(bundle).replace('__DIST_BUILD_ID__', buildId);
 
 if (check) {
   if (!existsSync(OUT)) {
