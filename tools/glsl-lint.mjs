@@ -26,6 +26,35 @@ const NEEDS_EXT = [
 ];
 
 let fails = 0;
+
+/**
+ * Every identifier a shader uses must be declared earlier in the SAME source.
+ * A helper injected above its uniforms compiles to
+ * "'uAtlas' : undeclared identifier" and the whole program fails to link.
+ */
+function checkDeclOrder(name, src) {
+  const lines = src.split('\n');
+  const declLine = {};
+  const bad = [];
+  const declRe = /^\s*(?:uniform|attribute|varying)\s+\w+\s+(\w+)/;
+  lines.forEach((l, i) => {
+    const m = l.match(declRe);
+    if (m && declLine[m[1]] === undefined) declLine[m[1]] = i;
+  });
+  // Any use of a declared name must come after its declaration.
+  for (const [nm, at] of Object.entries(declLine)) {
+    const useRe = new RegExp('\\b' + nm + '\\b');
+    for (let i = 0; i < at; i++) {
+      const l = lines[i];
+      if (!l.trim() || l.trim().startsWith('//') || l.trim().startsWith('#')) continue;
+      if (l.match(declRe)) continue;
+      if (useRe.test(l)) { bad.push(`'${nm}' used on line ${i + 1} but declared on line ${at + 1}`); break; }
+    }
+  }
+  if (bad.length) { fails++; console.log('  FAIL ' + name + ' (declaration order)'); bad.forEach(b => console.log('        - ' + b)); }
+  else console.log('  ok   ' + name + ' (declaration order)');
+}
+
 function check(name, src) {
   const bad = [];
   for (const r of RULES) if (r.re.test(src)) bad.push(r.msg);
@@ -57,7 +86,9 @@ for (const n of Object.keys(S)) {
 }
 console.log('=== собранный фрагмент террейна (все 4 комбинации расширений) ===');
 for (const g of [true, false]) for (const d of [true, false]) {
-  check(`buildTerrainFragment(grad=${g}, deriv=${d})`, S.buildTerrainFragment(g, d));
+  const src = S.buildTerrainFragment(g, d);
+  check(`buildTerrainFragment(grad=${g}, deriv=${d})`, src);
+  checkDeclOrder(`buildTerrainFragment(grad=${g}, deriv=${d})`, src);
 }
 // Каждый uniform/attribute в шейдере должен быть объявлен (RawShaderMaterial
 // не добавляет ничего автоматически).
@@ -72,5 +103,27 @@ for (const n of ['TERRAIN_VERT','ENTITY_VERT','SKY_VERT','PARTICLE_VERT','FLAT_V
   console.log((undecl.length ? '  FAIL ' : '  ok   ') + n + (undecl.length ? ' -> НЕ объявлены: ' + undecl.join(', ') : ''));
   if (undecl.length) fails++;
 }
+// A shader that declares position/uv/modelViewMatrix/projectionMatrix itself
+// MUST be used with RawShaderMaterial. ShaderMaterial prepends its own copies
+// and the compiler rejects the redefinition.
+console.log('=== тип материала соответствует шейдеру? ===');
+{
+  const { readFileSync } = await import('node:fs');
+  const { globSync } = await import('node:fs');
+  const files = ['src/render/particles.js', 'src/render/chunkRenderer.js',
+                 'src/render/entityRenderer.js', 'src/main.js'];
+  for (const f of files) {
+    let txt = '';
+    try { txt = readFileSync(new URL('../' + f, import.meta.url), 'utf8'); } catch (e) { continue; }
+    const usesPlain = /new\s+THREE\.ShaderMaterial\s*\(/.test(txt);
+    if (usesPlain) {
+      console.log('  FAIL ' + f + ' uses THREE.ShaderMaterial; these shaders declare their own built-ins and need RawShaderMaterial');
+      fails++;
+    } else {
+      console.log('  ok   ' + f);
+    }
+  }
+}
+
 console.log(fails === 0 ? '\nВСЁ ЧИСТО' : `\n${fails} ПРОБЛЕМ`);
 process.exit(fails ? 1 : 0);

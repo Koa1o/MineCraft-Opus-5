@@ -827,6 +827,16 @@ export class Camera extends Object3D {
     this.projectionMatrix = new Matrix4();
     this.projectionMatrixInverse = new Matrix4();
   }
+  /**
+   * Real three.js keeps matrixWorldInverse in sync here. Without it the inverse
+   * stays identity, so every frustum test is computed as if the camera sat at
+   * the origin and culling rejects geometry that is genuinely in view — which
+   * makes any headless "is anything visible?" check meaningless.
+   */
+  updateMatrixWorld(force = false) {
+    super.updateMatrixWorld(force);
+    this.matrixWorldInverse.copy(this.matrixWorld).invert();
+  }
   updateProjectionMatrix() {}
   getWorldDirection(target) { return target.set(0, 0, -1).applyQuaternion(this.quaternion); }
 }
