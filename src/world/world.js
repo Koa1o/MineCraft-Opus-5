@@ -446,7 +446,12 @@ export class World {
     if (oldId === id && !opts.force) return false;
 
     // --- write the block (keeps section counters correct) ---
-    c.set(lx, y, z, id);
+    // Chunk.set() takes LOCAL coordinates. Passing the world `z` here wrote to
+    // (lx * 16 + z) instead of (lx * 16 + lz), so for any negative coordinate the
+    // write landed in a different column — the targeted block never changed while
+    // the drops and sounds still fired. That is the "blocks won't break, I only
+    // see the drops" bug, and it also silently corrupted a neighbouring column.
+    c.set(lx, y, lz, id);
     if (!opts.keepMeta) c.meta[li] = 0;
     c.updateHeight(lx, lz, this._flags);
     c.modified = true;
