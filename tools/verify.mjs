@@ -355,3 +355,22 @@ export async function checkShaders() {
     return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// (g) Player movement — physics reaches the intended speeds and the game loop
+//     actually ticks the player (World skips players on purpose).
+// ---------------------------------------------------------------------------
+export async function checkMovement() {
+  const { execFileSync } = await import('node:child_process');
+  console.log('\n--- (g) player movement ---');
+  try {
+    execFileSync(process.execPath, [new URL('movement-test.mjs', import.meta.url).pathname],
+      { encoding: 'utf8' });
+    console.log('PASS: walk/sprint/sneak/jump within tolerance, player is ticked');
+    return true;
+  } catch (e) {
+    const out = ((e.stdout || '') + (e.stderr || '')).trim();
+    console.log('FAIL:\n' + out.split('\n').filter((l) => /FAIL/.test(l)).join('\n'));
+    return false;
+  }
+}
