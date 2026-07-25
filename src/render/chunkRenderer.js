@@ -193,7 +193,7 @@ export class ChunkRenderer {
       // Store bounding sphere in world space for frustum culling
       mesh.userData.cx = chunk.cx;
       mesh.userData.cz = chunk.cz;
-      mesh.userData.boundingSphere = CHUNKREND_chunkBoundingSphere(THREE, chunk.cx, chunk.cz);
+      mesh.userData.boundingSphere = CHUNKREND_chunkBoundingSphere(THREE, chunk.cx, chunk.cz, meshData);
       this._scene.add(mesh);
       meshSet.meshes.push(mesh);
     }
@@ -240,7 +240,18 @@ export class ChunkRenderer {
     const aoStrength = this._settings.ao !== false ? 1 : 0;
     const cpos = camera.position;
 
-    // Compute frustum from camera
+    // Compute the frustum from the camera.
+    //
+    // The camera was moved earlier this frame, and WebGLRenderer.render() is
+    // what normally refreshes matrixWorld / matrixWorldInverse — but that runs
+    // AFTER this culling pass. Using the stale inverse tests every chunk against
+    // where the camera used to be, which can cull geometry that is actually on
+    // screen. Refresh it here so culling matches what is about to be drawn.
+    if (camera.updateMatrixWorld) camera.updateMatrixWorld(true);
+    if (camera.matrixWorldInverse && camera.matrixWorld
+        && typeof camera.matrixWorldInverse.copy === 'function') {
+      camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    }
     this._projScreenMatrix.multiplyMatrices(
       camera.projectionMatrix,
       camera.matrixWorldInverse,
@@ -301,18 +312,43 @@ export class ChunkRenderer {
   }
 }
 
-/** Compute a bounding sphere for a 16x128x16 chunk in world space. */
-function CHUNKREND_chunkBoundingSphere(THREE, cx, cz) {
+/**
+ * Bounding sphere for a chunk's ACTUAL geometry, in world space.
+ *
+ * A sphere covering the full 16x128x16 column has a 65-block radius centred at
+ * y=64. Terrain only occupies a thin band of that column, so such a sphere
+ * overlaps the view frustum from almost anywhere and culling rejects nothing
+ * (measured: 82 of 82 chunks "visible" in every direction, including straight
+ * up). Fitting the sphere to the geometry's real vertical extent is what makes
+ * culling actually cull.
+ *
+ * @param {object} meshData mesher output, used for its real Y bounds
+ */
+function CHUNKREND_chunkBoundingSphere(THREE, cx, cz, meshData) {
   const ox = cx * CHUNKREND_W + CHUNKREND_W / 2;
-  const oy = CHUNKREND_H / 2;
   const oz = cz * CHUNKREND_W + CHUNKREND_W / 2;
-  const r = Math.sqrt(
-    (CHUNKREND_W / 2) * (CHUNKREND_W / 2) +
-    (CHUNKREND_H / 2) * (CHUNKREND_H / 2) +
-    (CHUNKREND_W / 2) * (CHUNKREND_W / 2),
-  );
-  const sphere = new THREE.Sphere(new THREE.Vector3(ox, oy, oz), r);
-  return sphere;
+
+  // Scan the emitted vertices for the true vertical span.
+  let minY = Infinity, maxY = -Infinity;
+  if (meshData) {
+    for (const key of ['opaque', 'cutout', 'translucent']) {
+      const pass = meshData[key];
+      if (!pass || !pass.position) continue;
+      const pos = pass.position;
+      for (let i = 1; i < pos.length; i += 3) {
+        const y = pos[i];
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (!isFinite(minY)) { minY = 0; maxY = CHUNKREND_H; }
+
+  const oy = (minY + maxY) / 2;
+  const halfY = Math.max(0.5, (maxY - minY) / 2);
+  const halfXZ = CHUNKREND_W / 2;
+  const r = Math.sqrt(halfXZ * halfXZ + halfY * halfY + halfXZ * halfXZ);
+  return new THREE.Sphere(new THREE.Vector3(ox, oy, oz), r);
 }
 
 function CHUNKREND_chunkKey(cx, cz) {

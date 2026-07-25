@@ -28308,7 +28308,15 @@ void main() {
 }
 `;
 
-const TERRAIN_FRAG = /* glsl */`
+/**
+ * Uniform/varying declarations for the terrain fragment shader.
+ *
+ * Kept separate from the body because the atlas-sampling helper injected by
+ * buildTerrainFragment() references uAtlas, and GLSL requires an identifier to
+ * be declared before use. Assembly order is therefore:
+ *   #extension -> precision -> THESE DECLARATIONS -> helper -> body.
+ */
+const TERRAIN_FRAG_DECLS = /* glsl */`
 uniform sampler2D uAtlas;
 uniform float uAtlasSize;
 uniform float uCell;
@@ -28328,7 +28336,10 @@ varying float vLight;
 varying float vFogDepth;
 varying float vFaceShade;
 varying vec3 vWorldPos;
+`;
 
+/** Body only. Declarations live in TERRAIN_FRAG_DECLS (see the note there). */
+const TERRAIN_FRAG = /* glsl */`
 void main() {
   // Wrap the in-tile uv (greedy quads tile the texture across many blocks),
   // then map into the art region of the cell, inset by half a texel.
@@ -28370,27 +28381,30 @@ void main() {
  * @param {boolean} useDeriv OES_standard_derivatives is available
  */
 function buildTerrainFragment(useGrad, useDeriv) {
-  let prelude = '';
-  if (useGrad) prelude += '#extension GL_EXT_shader_texture_lod : enable\n';
-  if (useDeriv) prelude += '#extension GL_OES_standard_derivatives : enable\n';
-  prelude += 'precision highp float;\n';
-
-  // Explicit-gradient sampling avoids a mip-level pop at the wrapped uv seam of
-  // a greedy-merged quad. It needs BOTH extensions, so degrade in two steps.
+  let src = '';
+  // 1. Extension directives must precede everything else in the source.
+  if (useGrad) src += '#extension GL_EXT_shader_texture_lod : enable\n';
+  if (useDeriv) src += '#extension GL_OES_standard_derivatives : enable\n';
+  // 2. RawShaderMaterial injects nothing, so declare precision ourselves.
+  src += 'precision highp float;\n';
+  // 3. Uniforms/varyings BEFORE the helper, which references uAtlas.
+  src += TERRAIN_FRAG_DECLS;
+  // 4. The sampling helper. Explicit gradients avoid a mip-level pop at the
+  //    wrapped uv seam of a greedy-merged quad, but need both extensions; fall
+  //    back to a plain fetch and let the driver choose the mip level.
   if (useGrad && useDeriv) {
-    prelude +=
-      'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n' +
-      '  vec2 dx = dFdx(tileUv) * scale;\n' +
-      '  vec2 dy = dFdy(tileUv) * scale;\n' +
-      '  return texture2DGradEXT(uAtlas, uv, dx, dy);\n' +
-      '}\n';
+    src += 'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n'
+        +  '  vec2 dx = dFdx(tileUv) * scale;\n'
+        +  '  vec2 dy = dFdy(tileUv) * scale;\n'
+        +  '  return texture2DGradEXT(uAtlas, uv, dx, dy);\n'
+        +  '}\n';
   } else {
-    prelude +=
-      'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n' +
-      '  return texture2D(uAtlas, uv);\n' +
-      '}\n';
+    src += 'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n'
+        +  '  return texture2D(uAtlas, uv);\n'
+        +  '}\n';
   }
-  return prelude + TERRAIN_FRAG;
+  // 5. Finally the shader body.
+  return src + TERRAIN_FRAG;
 }
 
 /** Entity / mob shader: skin texture + flat baked light + hurt flash. */
@@ -28825,7 +28839,7 @@ class ChunkRenderer {
       // Store bounding sphere in world space for frustum culling
       mesh.userData.cx = chunk.cx;
       mesh.userData.cz = chunk.cz;
-      mesh.userData.boundingSphere = CHUNKREND_chunkBoundingSphere(THREE, chunk.cx, chunk.cz);
+      mesh.userData.boundingSphere = CHUNKREND_chunkBoundingSphere(THREE, chunk.cx, chunk.cz, meshData);
       this._scene.add(mesh);
       meshSet.meshes.push(mesh);
     }
@@ -28872,7 +28886,18 @@ class ChunkRenderer {
     const aoStrength = this._settings.ao !== false ? 1 : 0;
     const cpos = camera.position;
 
-    // Compute frustum from camera
+    // Compute the frustum from the camera.
+    //
+    // The camera was moved earlier this frame, and WebGLRenderer.render() is
+    // what normally refreshes matrixWorld / matrixWorldInverse — but that runs
+    // AFTER this culling pass. Using the stale inverse tests every chunk against
+    // where the camera used to be, which can cull geometry that is actually on
+    // screen. Refresh it here so culling matches what is about to be drawn.
+    if (camera.updateMatrixWorld) camera.updateMatrixWorld(true);
+    if (camera.matrixWorldInverse && camera.matrixWorld
+        && typeof camera.matrixWorldInverse.copy === 'function') {
+      camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    }
     this._projScreenMatrix.multiplyMatrices(
       camera.projectionMatrix,
       camera.matrixWorldInverse,
@@ -28933,18 +28958,43 @@ class ChunkRenderer {
   }
 }
 
-/** Compute a bounding sphere for a 16x128x16 chunk in world space. */
-function CHUNKREND_chunkBoundingSphere(THREE, cx, cz) {
+/**
+ * Bounding sphere for a chunk's ACTUAL geometry, in world space.
+ *
+ * A sphere covering the full 16x128x16 column has a 65-block radius centred at
+ * y=64. Terrain only occupies a thin band of that column, so such a sphere
+ * overlaps the view frustum from almost anywhere and culling rejects nothing
+ * (measured: 82 of 82 chunks "visible" in every direction, including straight
+ * up). Fitting the sphere to the geometry's real vertical extent is what makes
+ * culling actually cull.
+ *
+ * @param {object} meshData mesher output, used for its real Y bounds
+ */
+function CHUNKREND_chunkBoundingSphere(THREE, cx, cz, meshData) {
   const ox = cx * CHUNKREND_W + CHUNKREND_W / 2;
-  const oy = CHUNKREND_H / 2;
   const oz = cz * CHUNKREND_W + CHUNKREND_W / 2;
-  const r = Math.sqrt(
-    (CHUNKREND_W / 2) * (CHUNKREND_W / 2) +
-    (CHUNKREND_H / 2) * (CHUNKREND_H / 2) +
-    (CHUNKREND_W / 2) * (CHUNKREND_W / 2),
-  );
-  const sphere = new THREE.Sphere(new THREE.Vector3(ox, oy, oz), r);
-  return sphere;
+
+  // Scan the emitted vertices for the true vertical span.
+  let minY = Infinity, maxY = -Infinity;
+  if (meshData) {
+    for (const key of ['opaque', 'cutout', 'translucent']) {
+      const pass = meshData[key];
+      if (!pass || !pass.position) continue;
+      const pos = pass.position;
+      for (let i = 1; i < pos.length; i += 3) {
+        const y = pos[i];
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (!isFinite(minY)) { minY = 0; maxY = CHUNKREND_H; }
+
+  const oy = (minY + maxY) / 2;
+  const halfY = Math.max(0.5, (maxY - minY) / 2);
+  const halfXZ = CHUNKREND_W / 2;
+  const r = Math.sqrt(halfXZ * halfXZ + halfY * halfY + halfXZ * halfXZ);
+  return new THREE.Sphere(new THREE.Vector3(ox, oy, oz), r);
 }
 
 function CHUNKREND_chunkKey(cx, cz) {
@@ -30149,7 +30199,11 @@ class ParticleSystem {
 
     // Shader material using PARTICLE_VERT/PARTICLE_FRAG from shaders.js
     // We accept a material or build a basic one here
-    const mat = opts.material || new THREE.ShaderMaterial({
+    // RawShaderMaterial, NOT ShaderMaterial: the shaders below declare their own
+    // position/uv attributes and modelViewMatrix/projectionMatrix uniforms.
+    // ShaderMaterial prepends its own declarations for those, which makes the
+    // GLSL compiler fail with "'position' : redefinition" and kills the program.
+    const mat = opts.material || new THREE.RawShaderMaterial({
       uniforms: {
         uAtlas: { value: atlas && atlas.texture ? atlas.texture : null },
         uCellsPerRow: { value: 16 },

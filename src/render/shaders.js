@@ -123,7 +123,15 @@ void main() {
 }
 `;
 
-export const TERRAIN_FRAG = /* glsl */`
+/**
+ * Uniform/varying declarations for the terrain fragment shader.
+ *
+ * Kept separate from the body because the atlas-sampling helper injected by
+ * buildTerrainFragment() references uAtlas, and GLSL requires an identifier to
+ * be declared before use. Assembly order is therefore:
+ *   #extension -> precision -> THESE DECLARATIONS -> helper -> body.
+ */
+export const TERRAIN_FRAG_DECLS = /* glsl */`
 uniform sampler2D uAtlas;
 uniform float uAtlasSize;
 uniform float uCell;
@@ -143,7 +151,10 @@ varying float vLight;
 varying float vFogDepth;
 varying float vFaceShade;
 varying vec3 vWorldPos;
+`;
 
+/** Body only. Declarations live in TERRAIN_FRAG_DECLS (see the note there). */
+export const TERRAIN_FRAG = /* glsl */`
 void main() {
   // Wrap the in-tile uv (greedy quads tile the texture across many blocks),
   // then map into the art region of the cell, inset by half a texel.
@@ -185,27 +196,30 @@ void main() {
  * @param {boolean} useDeriv OES_standard_derivatives is available
  */
 export function buildTerrainFragment(useGrad, useDeriv) {
-  let prelude = '';
-  if (useGrad) prelude += '#extension GL_EXT_shader_texture_lod : enable\n';
-  if (useDeriv) prelude += '#extension GL_OES_standard_derivatives : enable\n';
-  prelude += 'precision highp float;\n';
-
-  // Explicit-gradient sampling avoids a mip-level pop at the wrapped uv seam of
-  // a greedy-merged quad. It needs BOTH extensions, so degrade in two steps.
+  let src = '';
+  // 1. Extension directives must precede everything else in the source.
+  if (useGrad) src += '#extension GL_EXT_shader_texture_lod : enable\n';
+  if (useDeriv) src += '#extension GL_OES_standard_derivatives : enable\n';
+  // 2. RawShaderMaterial injects nothing, so declare precision ourselves.
+  src += 'precision highp float;\n';
+  // 3. Uniforms/varyings BEFORE the helper, which references uAtlas.
+  src += TERRAIN_FRAG_DECLS;
+  // 4. The sampling helper. Explicit gradients avoid a mip-level pop at the
+  //    wrapped uv seam of a greedy-merged quad, but need both extensions; fall
+  //    back to a plain fetch and let the driver choose the mip level.
   if (useGrad && useDeriv) {
-    prelude +=
-      'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n' +
-      '  vec2 dx = dFdx(tileUv) * scale;\n' +
-      '  vec2 dy = dFdy(tileUv) * scale;\n' +
-      '  return texture2DGradEXT(uAtlas, uv, dx, dy);\n' +
-      '}\n';
+    src += 'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n'
+        +  '  vec2 dx = dFdx(tileUv) * scale;\n'
+        +  '  vec2 dy = dFdy(tileUv) * scale;\n'
+        +  '  return texture2DGradEXT(uAtlas, uv, dx, dy);\n'
+        +  '}\n';
   } else {
-    prelude +=
-      'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n' +
-      '  return texture2D(uAtlas, uv);\n' +
-      '}\n';
+    src += 'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n'
+        +  '  return texture2D(uAtlas, uv);\n'
+        +  '}\n';
   }
-  return prelude + TERRAIN_FRAG;
+  // 5. Finally the shader body.
+  return src + TERRAIN_FRAG;
 }
 
 /** Entity / mob shader: skin texture + flat baked light + hurt flash. */

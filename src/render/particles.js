@@ -92,7 +92,11 @@ export class ParticleSystem {
 
     // Shader material using PARTICLE_VERT/PARTICLE_FRAG from shaders.js
     // We accept a material or build a basic one here
-    const mat = opts.material || new THREE.ShaderMaterial({
+    // RawShaderMaterial, NOT ShaderMaterial: the shaders below declare their own
+    // position/uv attributes and modelViewMatrix/projectionMatrix uniforms.
+    // ShaderMaterial prepends its own declarations for those, which makes the
+    // GLSL compiler fail with "'position' : redefinition" and kills the program.
+    const mat = opts.material || new THREE.RawShaderMaterial({
       uniforms: {
         uAtlas: { value: atlas && atlas.texture ? atlas.texture : null },
         uCellsPerRow: { value: 16 },
