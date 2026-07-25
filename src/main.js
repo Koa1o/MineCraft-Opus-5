@@ -24,6 +24,11 @@ import { DimensionManager } from './world/world.js';
 const MAIN_MAX_PIXEL_RATIO = 2;
 const MAIN_AUTOSAVE_INTERVAL = 30000;
 const MAIN_TARGET_FOV = 70;
+/** Hard ceiling on the pre-gameplay world build, so boot always finishes. */
+const MAIN_PREWARM_BUDGET_MS = 6000;
+const MAIN_nowMs = (typeof performance !== 'undefined' && performance.now)
+  ? () => performance.now()
+  : () => Date.now();
 
 // Build a loopback save key
 function MAIN_saveKey(seed) {
@@ -394,10 +399,14 @@ export class Game {
           this.world.spawnPoint.z = this.player.pos.z;
         }
         // The chosen spot may be outside the prewarmed area, so stream again.
-        MAIN_prewarm(this, 'preparing spawn…', 0.86, 0.11);
+        MAIN_prewarm(this, 'preparing spawn…', 0.80, 0.05);
       }
-      // Restore the user's render distance; the remainder streams in-game.
+      // Now fill in the FULL view distance before handing control over, with
+      // real per-chunk progress. Previously boot stopped at radius 3 and the
+      // rest streamed in after the Play button, which is what made the world
+      // look like it was still loading (or missing) once you were already in it.
       this.world.settings.renderDistance = fullRD;
+      MAIN_prewarmVisible(this, 0.85, 0.12);
     }
     this._progress(0.97, 'starting…');
 
@@ -868,4 +877,100 @@ function MAIN_prewarm(game, message, progFrom, progSpan) {
     }
   }
   game._progress(progFrom + progSpan, message);
+}
+
+/**
+ * Fill in the whole visible radius before gameplay starts, reporting honest
+ * progress as a fraction of chunks actually meshed.
+ *
+ * The earlier boot path only prewarmed a radius of 3 and let the rest stream in
+ * after the player took control, which read as "the world is still loading" (or
+ * as holes in the terrain) during the first seconds of play. Doing it here costs
+ * a little more startup time but the world is complete the moment you can move.
+ */
+function MAIN_prewarmVisible(game, progFrom, progSpan) {
+  const w = game.world;
+  if (!w) return;
+  const rd = w.settings.renderDistance | 0;
+  // Prewarm a radius of 4 (~49 chunks): enough that the terrain reads as a
+  // complete landscape out to the fog, while the outer rings stream in behind
+  // the player. Radius 6 is 113 chunks and pushed boot past 10s for no visible
+  // gain, since fog hides that distance anyway.
+  const want = Math.max(1, Math.min(rd, 4));
+  const pcx = Math.floor(game.player.pos.x / 16);
+  const pcz = Math.floor(game.player.pos.z / 16);
+
+  const target = [];
+  for (let dz = -want; dz <= want; dz++) {
+    for (let dx = -want; dx <= want; dx++) {
+      if (dx * dx + dz * dz > want * want) continue;   // circular, not square
+      target.push([pcx + dx, pcz + dz]);
+    }
+  }
+  // Nearest first, so the view directly around the player resolves earliest.
+  target.sort((a, b) => {
+    const da = (a[0] - pcx) ** 2 + (a[1] - pcz) ** 2;
+    const db = (b[0] - pcx) ** 2 + (b[1] - pcz) ** 2;
+    return da - db;
+  });
+
+  const total = target.length;
+  const deadline = MAIN_nowMs() + MAIN_PREWARM_BUDGET_MS;
+
+  // During boot there is no frame to protect, so lift the per-frame streaming
+  // limits: the 6ms time-slice exists to keep gameplay smooth, and leaving it on
+  // here makes loading crawl (a few chunks per second). Restored below.
+  const savedBudget = {
+    gen: w.settings.maxGenPerFrame,
+    dec: w.settings.maxDecoratePerFrame,
+    lit: w.settings.maxLightPerFrame,
+    mesh: w.settings.maxMeshPerFrame,
+    slice: w.settings.streamBudgetMs,
+  };
+  w.settings.maxGenPerFrame = 8;
+  w.settings.maxDecoratePerFrame = 8;
+  w.settings.maxLightPerFrame = 8;
+  w.settings.maxMeshPerFrame = 8;
+  w.settings.streamBudgetMs = 1000;   // effectively unlimited for the load screen
+  let ready = 0;
+  for (let iter = 0; iter < 4000; iter++) {
+    // Let the world's own budgeted pipeline advance.
+    w.update(1 / 20, game.player.pos);
+
+    ready = 0;
+    for (const [cx, cz] of target) {
+      const c = w.getChunk(cx, cz);
+      if (c && c.meshed) ready++;
+    }
+    if (iter % 8 === 0) {
+      game._progress(progFrom + (ready / total) * progSpan,
+        'building world  ' + ready + ' / ' + total + ' chunks');
+    }
+    if (ready >= total) break;
+    // Never hang the boot indefinitely on a slow machine.
+    if (MAIN_nowMs() > deadline) break;
+  }
+  // Upload every prewarmed chunk to the GPU NOW. The main loop only drains a
+  // few per frame (deliberately, to protect frame time), so without this the
+  // player takes control looking at an empty scene while 49 chunks trickle in.
+  if (game.chunkRenderer && w.pendingUploads && w.pendingUploads.size) {
+    game._progress(progFrom + progSpan * 0.95, 'uploading geometry…');
+    for (const chunk of [...w.pendingUploads]) {
+      if (chunk.meshed && chunk.meshData) {
+        game.chunkRenderer.syncChunk(chunk, chunk.meshData);
+        chunk._rendererSynced = true;
+        chunk._syncGeneration = chunk._meshGeneration || 0;
+      }
+      w.pendingUploads.delete(chunk);
+    }
+  }
+
+  // Hand the frame-time limits back before gameplay starts.
+  w.settings.maxGenPerFrame = savedBudget.gen;
+  w.settings.maxDecoratePerFrame = savedBudget.dec;
+  w.settings.maxLightPerFrame = savedBudget.lit;
+  w.settings.maxMeshPerFrame = savedBudget.mesh;
+  w.settings.streamBudgetMs = savedBudget.slice;
+
+  game._progress(progFrom + progSpan, 'building world  ' + ready + ' / ' + total + ' chunks');
 }

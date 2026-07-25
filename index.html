@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<!-- GitHub Pages sets a long max-age; without these a stale build keeps loading. -->
+<meta http-equiv="Cache-Control" content="no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>Voxelcraft — Opus 5</title>
 <style>
   html, body {
@@ -75,6 +78,7 @@
 <div id="mc-boot">
   <h1>VOXELCRAFT</h1>
   <div class="sub">Opus 5 &middot; procedural voxel sandbox</div>
+  <div class="sub" id="mc-build" style="margin-top:6px;opacity:.4;font-size:11px"></div>
   <div id="mc-bar"><i></i></div>
   <div id="mc-status">initialising&hellip;</div>
   <button id="mc-play" style="display:none">Play</button>
@@ -92,11 +96,17 @@
 // common failure mode (opening this file straight from file:// in a browser
 // that blocks module loading) and points at dist/game.html in that case.
 // ---------------------------------------------------------------------------
+// Bumped by tools/inline.mjs on every build. Shown on the splash screen so you
+// can tell at a glance whether the browser served a fresh copy.
+const MC_BUILD = '822ed8ae-2026-07-25';
 const bootEl = document.getElementById('mc-boot');
 const barEl = document.querySelector('#mc-bar > i');
 const statusEl = document.getElementById('mc-status');
 const errEl = document.getElementById('mc-error');
 const playEl = document.getElementById('mc-play');
+
+const buildEl = document.getElementById('mc-build');
+if (buildEl) buildEl.textContent = 'build ' + MC_BUILD;
 
 function progress(pct, msg) {
   barEl.style.width = Math.round(pct * 100) + '%';
@@ -126,7 +136,9 @@ try {
   progress(0.08, 'loading three.js from CDN…');
   const THREE = await import('three');
   progress(0.30, 'building texture atlas…');
-  const { Game } = await import('./src/main.js');
+  // Cache-bust: GitHub Pages serves aggressive caching headers, and a stale
+  // main.js silently keeps old shader code alive. BUILD_ID changes every build.
+  const { Game } = await import('./src/main.js?v=' + MC_BUILD);
   progress(0.55, 'generating world…');
 
   const game = new Game(document.getElementById('mc-root'), {
