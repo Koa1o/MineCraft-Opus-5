@@ -15,8 +15,8 @@ const CHUNKREND_H = 128;
 const CHUNKREND_SKY_RADIUS = 900;
 
 /** Build the three shared terrain materials (opaque / cutout / translucent). */
-function CHUNKREND_buildMaterials(THREE, atlasBundle, settings, useGrad) {
-  const fragSrc = buildTerrainFragment(useGrad);
+function CHUNKREND_buildMaterials(THREE, atlasBundle, settings, useGrad, useDeriv) {
+  const fragSrc = buildTerrainFragment(useGrad, useDeriv);
 
   const CHUNKREND_commonUniforms = () => ({
     uAtlas:     { value: atlasBundle.texture },
@@ -112,7 +112,7 @@ export class ChunkRenderer {
     // context (passed via settings.renderer) and fall back to a probe canvas.
     // Everything is wrapped defensively: a missing or stubbed GL context must
     // degrade to the non-gradient shader path, never throw during boot.
-    let useGrad = false;
+    let useGrad = false, useDeriv = false;
     try {
       let gl = null;
       const r = this._settings.renderer;
@@ -123,18 +123,19 @@ export class ChunkRenderer {
           gl = probe.getContext('webgl2') || probe.getContext('webgl');
         }
       }
-      // WebGL2 has textureGrad in core, so the extension is only needed on WebGL1.
-      const isGL2 = !!(gl && typeof WebGL2RenderingContext !== 'undefined'
-        && gl instanceof WebGL2RenderingContext);
-      if (isGL2) useGrad = false;
-      else if (gl && typeof gl.getExtension === 'function') {
+      if (gl && typeof gl.getExtension === 'function') {
+        // Both are needed for explicit-gradient sampling; either missing means
+        // we fall back to plain texture2D (driver picks the mip level).
         useGrad = !!gl.getExtension('EXT_shader_texture_lod');
+        useDeriv = !!gl.getExtension('OES_standard_derivatives');
       }
     } catch (e) {
-      useGrad = false;
+      useGrad = false; useDeriv = false;
     }
 
-    const mats = CHUNKREND_buildMaterials(THREE, atlasBundle, this._settings, useGrad);
+    const mats = CHUNKREND_buildMaterials(
+      THREE, atlasBundle, this._settings, useGrad, useDeriv,
+    );
     this._opaqueMat = mats.opaqueMat;
     this._cutoutMat = mats.cutoutMat;
     this._translucentMat = mats.translucentMat;

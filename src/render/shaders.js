@@ -46,7 +46,20 @@ varying float vFogDepth;
 varying float vFaceShade;
 varying vec3 vWorldPos;
 
-const float ANIM_SPEEDS[8] = float[8](0.0, 4.0, 8.0, 12.0, 2.0, 16.0, 24.0, 6.0);
+// Animation speed lookup. NOTE: GLSL array-constructor syntax is GLSL 3.00
+// only. RawShaderMaterial compiles as GLSL ES 1.00, where it is a fatal parse
+// error that silently kills the whole shader (and with it the entire world).
+// A branch chain works everywhere and is cheaper on old GPUs anyway.
+float mcAnimFps(float idx) {
+  if (idx < 0.5) return 0.0;
+  if (idx < 1.5) return 4.0;
+  if (idx < 2.5) return 8.0;
+  if (idx < 3.5) return 12.0;
+  if (idx < 4.5) return 2.0;
+  if (idx < 5.5) return 16.0;
+  if (idx < 6.5) return 24.0;
+  return 6.0;
+}
 
 void main() {
   // ---- animation: advance the tile index by the current frame
@@ -54,7 +67,7 @@ void main() {
   float speedIdx = floor(aAnim / 32.0);
   float tile = aTile;
   if (frames > 1.5) {
-    float fps = ANIM_SPEEDS[int(speedIdx)];
+    float fps = mcAnimFps(speedIdx);
     float f = floor(mod(uTime * fps, frames));
     tile += f;
   }
@@ -111,8 +124,6 @@ void main() {
 `;
 
 export const TERRAIN_FRAG = /* glsl */`
-precision highp float;
-
 uniform sampler2D uAtlas;
 uniform float uAtlasSize;
 uniform float uCell;
@@ -141,12 +152,7 @@ void main() {
   float gutter = (uCell - uArt) * 0.5 * texel;
   vec2 uv = vCellOrigin + vec2(gutter) + f * (uArt * texel);
 
-  // Manual derivative so the wrap seam does not force a high-detail mip.
-  vec2 dx = dFdx(vUv) * uArt * texel;
-  vec2 dy = dFdy(vUv) * uArt * texel;
-  vec4 texel4 = texture2DGradEXT_FALLBACK(uv, dx, dy);
-
-  vec4 c = texel4;
+  vec4 c = mcSampleAtlas(uv, vUv, uArt * texel);
   if (c.a < uAlphaTest) discard;
 
   vec3 rgb = c.rgb * vTint * vLight * vFaceShade;
@@ -163,18 +169,43 @@ void main() {
 `;
 
 /**
- * WebGL1 has no textureGrad without an extension, and WebGL2/GLSL3 renames
- * things. Rather than depend on either, the fragment shader above is assembled
- * with a small prelude that defines texture2DGradEXT_FALLBACK appropriately.
+ * Assemble the terrain fragment shader.
+ *
+ * Two GLSL ES 1.00 rules make this fiddly, and getting either wrong kills the
+ * shader outright (which renders the whole world invisible):
+ *
+ *  1. `#extension` directives MUST precede every other statement in the source,
+ *     including `precision`. So the prelude is PREPENDED, never spliced into the
+ *     middle of the shader body.
+ *  2. `dFdx`/`dFdy` and `texture2DGradEXT` are not core in GLSL ES 1.00; each
+ *     needs its own extension. When they are unavailable we fall back to a plain
+ *     `texture2D`, which just means the driver picks the mip level itself.
+ *
+ * @param {boolean} useGrad  EXT_shader_texture_lod is available
+ * @param {boolean} useDeriv OES_standard_derivatives is available
  */
-export function buildTerrainFragment(useGrad) {
-  const prelude = useGrad
-    ? `#extension GL_EXT_shader_texture_lod : enable\n` +
-      `vec4 texture2DGradEXT_FALLBACK(vec2 uv, vec2 dx, vec2 dy){ return texture2DGradEXT(uAtlas, uv, dx, dy); }\n`
-    : `vec4 texture2DGradEXT_FALLBACK(vec2 uv, vec2 dx, vec2 dy){ return texture2D(uAtlas, uv); }\n`;
-  // Splice the helper in after the uniform declarations it needs.
-  const marker = 'varying vec2 vUv;';
-  return TERRAIN_FRAG.replace(marker, prelude + marker);
+export function buildTerrainFragment(useGrad, useDeriv) {
+  let prelude = '';
+  if (useGrad) prelude += '#extension GL_EXT_shader_texture_lod : enable\n';
+  if (useDeriv) prelude += '#extension GL_OES_standard_derivatives : enable\n';
+  prelude += 'precision highp float;\n';
+
+  // Explicit-gradient sampling avoids a mip-level pop at the wrapped uv seam of
+  // a greedy-merged quad. It needs BOTH extensions, so degrade in two steps.
+  if (useGrad && useDeriv) {
+    prelude +=
+      'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n' +
+      '  vec2 dx = dFdx(tileUv) * scale;\n' +
+      '  vec2 dy = dFdy(tileUv) * scale;\n' +
+      '  return texture2DGradEXT(uAtlas, uv, dx, dy);\n' +
+      '}\n';
+  } else {
+    prelude +=
+      'vec4 mcSampleAtlas(vec2 uv, vec2 tileUv, float scale) {\n' +
+      '  return texture2D(uAtlas, uv);\n' +
+      '}\n';
+  }
+  return prelude + TERRAIN_FRAG;
 }
 
 /** Entity / mob shader: skin texture + flat baked light + hurt flash. */

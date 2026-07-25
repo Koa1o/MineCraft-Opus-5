@@ -100,55 +100,98 @@ const FACE_DATA = [
   },
 ];
 
-/** Growable interleaved vertex buffer for one render pass. */
+/**
+ * Growable interleaved vertex buffer for one render pass.
+ *
+ * Writes go straight into typed arrays that grow by doubling. The previous
+ * version used plain JS arrays with `push`, which cost ~59k push calls per
+ * chunk (7 arrays x 4 vertices x every quad) and then copied everything again
+ * into typed arrays at the end. Writing typed memory directly removes both the
+ * call overhead and the second copy.
+ */
 class MeshBuffer {
-  constructor() {
-    this.pos = [];      // x,y,z
-    this.uv = [];       // u,v (in-tile, may exceed 1 for merged quads)
-    this.tile = [];     // atlas index
-    this.light = [];    // sky, block, ao
-    this.tint = [];     // r,g,b
-    this.anim = [];     // frames|speed<<5
-    this.norm = [];     // face index, or 6/7/8 for waving
-    this.idx = [];
+  constructor(initialQuads = 512) {
+    const v = initialQuads * 4;
+    this.pos = new Float32Array(v * 3);
+    this.uv = new Float32Array(v * 2);
+    this.tile = new Float32Array(v);
+    this.light = new Float32Array(v * 3);
+    this.tint = new Float32Array(v * 3);
+    this.anim = new Float32Array(v);
+    this.norm = new Float32Array(v);
+    this.idx = new Uint32Array(initialQuads * 6);
     this.vcount = 0;
+    this.icount = 0;
+    this.cap = v;
   }
   get empty() { return this.vcount === 0; }
+
+  /** Double every buffer when the next quad would not fit. */
+  _grow() {
+    const v = this.cap * 2;
+    const gf = (src, n) => { const a = new Float32Array(v * n); a.set(src); return a; };
+    this.pos = gf(this.pos, 3);
+    this.uv = gf(this.uv, 2);
+    this.tile = gf(this.tile, 1);
+    this.light = gf(this.light, 3);
+    this.tint = gf(this.tint, 3);
+    this.anim = gf(this.anim, 1);
+    this.norm = gf(this.norm, 1);
+    const ni = new Uint32Array(v / 4 * 6);
+    ni.set(this.idx);
+    this.idx = ni;
+    this.cap = v;
+  }
 
   /**
    * Push one quad. corners: 4x[x,y,z]; uvs: 4x[u,v];
    * lights: 4x[sky,block,ao]; tint: [r,g,b] shared.
    */
   quad(corners, uvs, tile, lights, tint, anim, norm, flip) {
+    if (this.vcount + 4 > this.cap) this._grow();
     const b = this.vcount;
+    let p3 = b * 3, p2 = b * 2, p1 = b;
     for (let i = 0; i < 4; i++) {
       const c = corners[i], uv = uvs[i], l = lights[i];
-      this.pos.push(c[0], c[1], c[2]);
-      this.uv.push(uv[0], uv[1]);
-      this.tile.push(tile);
-      this.light.push(l[0], l[1], l[2]);
-      this.tint.push(tint[0], tint[1], tint[2]);
-      this.anim.push(anim);
-      this.norm.push(norm);
+      this.pos[p3] = c[0]; this.pos[p3 + 1] = c[1]; this.pos[p3 + 2] = c[2];
+      this.uv[p2] = uv[0]; this.uv[p2 + 1] = uv[1];
+      this.tile[p1] = tile;
+      this.light[p3] = l[0]; this.light[p3 + 1] = l[1]; this.light[p3 + 2] = l[2];
+      this.tint[p3] = tint[0]; this.tint[p3 + 1] = tint[1]; this.tint[p3 + 2] = tint[2];
+      this.anim[p1] = anim;
+      this.norm[p1] = norm;
+      p3 += 3; p2 += 2; p1 += 1;
     }
     this.vcount += 4;
     // Flip the triangle split when AO would otherwise create a visible seam.
-    if (flip) this.idx.push(b + 1, b + 2, b + 3, b + 1, b + 3, b + 0);
-    else this.idx.push(b + 0, b + 1, b + 2, b + 0, b + 2, b + 3);
+    const o = this.icount;
+    if (flip) {
+      this.idx[o] = b + 1; this.idx[o + 1] = b + 2; this.idx[o + 2] = b + 3;
+      this.idx[o + 3] = b + 1; this.idx[o + 4] = b + 3; this.idx[o + 5] = b + 0;
+    } else {
+      this.idx[o] = b + 0; this.idx[o + 1] = b + 1; this.idx[o + 2] = b + 2;
+      this.idx[o + 3] = b + 0; this.idx[o + 4] = b + 2; this.idx[o + 5] = b + 3;
+    }
+    this.icount += 6;
   }
 
   toGeometryData() {
+    const v = this.vcount;
+    // subarray() would keep the whole oversized buffer alive, so slice to the
+    // exact used range and let the spare capacity be collected.
     return {
-      position: new Float32Array(this.pos),
-      aUv: new Float32Array(this.uv),
-      aTile: new Float32Array(this.tile),
-      aLight: new Float32Array(this.light),
-      aTint: new Float32Array(this.tint),
-      aAnim: new Float32Array(this.anim),
-      aNormal: new Float32Array(this.norm),
-      index: this.vcount > 65535 ? new Uint32Array(this.idx) : new Uint16Array(this.idx),
-      vertexCount: this.vcount,
-      indexCount: this.idx.length,
+      position: this.pos.slice(0, v * 3),
+      aUv: this.uv.slice(0, v * 2),
+      aTile: this.tile.slice(0, v),
+      aLight: this.light.slice(0, v * 3),
+      aTint: this.tint.slice(0, v * 3),
+      aAnim: this.anim.slice(0, v),
+      aNormal: this.norm.slice(0, v),
+      index: v > 65535
+        ? this.idx.slice(0, this.icount)
+        : new Uint16Array(this.idx.subarray(0, this.icount)),
+      vertexCount: v,
+      indexCount: this.icount,
     };
   }
 }
@@ -213,6 +256,61 @@ export class ChunkView {
     const lx = wx - c.cx * CHUNK_W, lz = wz - c.cz * CHUNK_W;
     return c.light[(lx * CHUNK_W + lz) * CHUNK_H + y];
   }
+  /**
+   * Flatten the 3x3 chunk neighbourhood into contiguous scratch arrays.
+   * Layout: (x+1) in 0..17, (z+1) in 0..17, y in 0..CHUNK_H-1.
+   * Index = ((x+1) * 18 + (z+1)) * CHUNK_H + y.
+   * Reused across calls via a module-level buffer, so meshing allocates nothing.
+   */
+  buildCache() {
+    const span = CHUNK_W + 2;
+    const need = span * span * CHUNK_H;
+    if (!MESH_cacheBlocks || MESH_cacheBlocks.length < need) {
+      MESH_cacheBlocks = new Uint16Array(need);
+      MESH_cacheLight = new Uint8Array(need);
+    }
+    const cb = MESH_cacheBlocks, cl = MESH_cacheLight;
+    for (let x = -1; x <= CHUNK_W; x++) {
+      for (let z = -1; z <= CHUNK_W; z++) {
+        const base = ((x + 1) * span + (z + 1)) * CHUNK_H;
+        // Resolve the owning chunk ONCE per column instead of once per block.
+        const wx = this.ox + x, wz = this.oz + z;
+        const c = this._chunkFor(wx, wz);
+        if (!c) {
+          // Outside the loaded world: treat as air lit by full skylight so the
+          // border does not read as a black wall.
+          for (let y = 0; y < CHUNK_H; y++) { cb[base + y] = 0; cl[base + y] = 15 << 4; }
+          continue;
+        }
+        const lx = wx - c.cx * CHUNK_W, lz = wz - c.cz * CHUNK_W;
+        const src = (lx * CHUNK_W + lz) * CHUNK_H;
+        for (let y = 0; y < CHUNK_H; y++) {
+          cb[base + y] = c.blocks[src + y];
+          cl[base + y] = c.light[src + y];
+        }
+      }
+    }
+    this.cache = cb;
+    this.cacheLight = cl;
+    this.span = span;
+    return this;
+  }
+
+  /** Cached block read. Only valid for x,z in -1..CHUNK_W after buildCache(). */
+  cget(x, y, z) {
+    if (y < 0 || y >= CHUNK_H) return 0;
+    if (!this.cache || x < -1 || x > CHUNK_W || z < -1 || z > CHUNK_W) return this.get(x, y, z);
+    return this.cache[((x + 1) * this.span + (z + 1)) * CHUNK_H + y];
+  }
+
+  /** Cached packed-light read. */
+  clight(x, y, z) {
+    if (y < 0) return 0;
+    if (y >= CHUNK_H) return 15 << 4;
+    if (!this.cache || x < -1 || x > CHUNK_W || z < -1 || z > CHUNK_W) return this.lightAt(x, y, z);
+    return this.cacheLight[((x + 1) * this.span + (z + 1)) * CHUNK_H + y];
+  }
+
   biome(x, z) {
     if (x >= 0 && x < CHUNK_W && z >= 0 && z < CHUNK_W) return this.chunk.biome[x * CHUNK_W + z];
     const wx = this.ox + x, wz = this.oz + z;
@@ -254,6 +352,12 @@ export class Mesher {
   mesh(world, cx, cz) {
     const view = new ChunkView(world, cx, cz);
     if (!view.chunk) return { opaque: null, cutout: null, translucent: null, faces: 0 };
+    // Flatten the 18x130x18 neighbourhood into two contiguous scratch arrays
+    // once per chunk. Vertex lighting and AO touch ~11k positions x 8 samples
+    // each, and doing that through ChunkView means a divide, a hash and a Map
+    // lookup every single time. With the cache each sample is one array read,
+    // which is where most of the mesher's speed comes from.
+    view.buildCache();
     const bufs = {
       opaque: new MeshBuffer(),
       cutout: new MeshBuffer(),
@@ -273,7 +377,7 @@ export class Mesher {
   _faceVisible(view, id, x, y, z, f) {
     const F = this.flags;
     const d = FACE_DATA[f].n;
-    const nid = view.get(x + d[0], y + d[1], z + d[2]);
+    const nid = view.cget(x + d[0], y + d[1], z + d[2]);
     if (nid === id) {
       // Same block: cull unless the block explicitly doesn't self-cull (leaves).
       return F.cullSelf[id] === 0;
@@ -306,29 +410,28 @@ export class Mesher {
     // The 4 blocks touching this vertex on the *outside* of the face.
     const [s1, s2, cr] = fd.ao[corner];
     const bx = x + n[0], by = y + n[1], bz = z + n[2];
-    const l0 = view.lightAt(bx, by, bz);
+    const l0 = view.clight(bx, by, bz);
     let sky = l0 >> 4, blk = l0 & 15, cnt = 1;
     let ao = 0;
+    // The same three neighbours drive both smooth light and AO, so sample each
+    // one once and reuse. All reads go through the flat cache.
+    const ax = x + s1[0], ay = y + s1[1], az = z + s1[2];
+    const bx2 = x + s2[0], by2 = y + s2[1], bz2 = z + s2[2];
+    const ccx = x + cr[0], ccy = y + cr[1], ccz = z + cr[2];
+    const id1 = view.cget(ax, ay, az);
+    const id2 = view.cget(bx2, by2, bz2);
+    const idc = view.cget(ccx, ccy, ccz);
+    const op1 = F.opacity[id1], op2 = F.opacity[id2], opc = F.opacity[idc];
     if (this.settings.smoothLight) {
-      const pts = [
-        [x + s1[0], y + s1[1], z + s1[2]],
-        [x + s2[0], y + s2[1], z + s2[2]],
-        [x + cr[0], y + cr[1], z + cr[2]],
-      ];
-      for (const p of pts) {
-        const id = view.get(p[0], p[1], p[2]);
-        if (F.opacity[id] === 0) {
-          const l = view.lightAt(p[0], p[1], p[2]);
-          sky += l >> 4; blk += l & 15; cnt++;
-        }
-      }
-      sky = Math.round(sky / cnt);
-      blk = Math.round(blk / cnt);
+      if (op1 === 0) { const l = view.clight(ax, ay, az); sky += l >> 4; blk += l & 15; cnt++; }
+      if (op2 === 0) { const l = view.clight(bx2, by2, bz2); sky += l >> 4; blk += l & 15; cnt++; }
+      if (opc === 0) { const l = view.clight(ccx, ccy, ccz); sky += l >> 4; blk += l & 15; cnt++; }
+      // Integer divide is enough here and avoids Math.round in the hot loop.
+      sky = (sky / cnt + 0.5) | 0;
+      blk = (blk / cnt + 0.5) | 0;
     }
     if (this.settings.ao) {
-      const o1 = F.opacity[view.get(x + s1[0], y + s1[1], z + s1[2])] > 0 ? 1 : 0;
-      const o2 = F.opacity[view.get(x + s2[0], y + s2[1], z + s2[2])] > 0 ? 1 : 0;
-      const oc = F.opacity[view.get(x + cr[0], y + cr[1], z + cr[2])] > 0 ? 1 : 0;
+      const o1 = op1 > 0 ? 1 : 0, o2 = op2 > 0 ? 1 : 0, oc = opc > 0 ? 1 : 0;
       ao = (o1 && o2) ? 3 : (o1 + o2 + oc);
     }
     return [sky, blk, ao];
@@ -690,6 +793,11 @@ export class Mesher {
 }
 
 const WHITE_TINT = [1, 1, 1];
+
+// Reusable scratch buffers for ChunkView.buildCache(). Module-level so repeated
+// meshing does not allocate; sized on first use.
+let MESH_cacheBlocks = null;
+let MESH_cacheLight = null;
 
 /**
  * UV rect for one face of a sub-cube box, so partial blocks show the matching

@@ -279,6 +279,10 @@ export class Game {
     this.world.players.push(this.player);
 
     // Renderers
+    // Pass the real renderer so ChunkRenderer probes the ACTUAL GL context for
+    // shader extensions rather than a throwaway canvas (whose capabilities can
+    // differ from the live context).
+    this.settings.renderer = this.renderer;
     this.chunkRenderer = new ChunkRenderer(THREE, this.scene, this.atlasBundle, this.settings);
     this.skyRenderer = new SkyRenderer(THREE, this.scene);
     this.entityRenderer = new EntityRenderer(THREE, this.scene, this.settings);
@@ -555,37 +559,31 @@ function MAIN_gameUpdate(game, dt) {
     world.update(dt, player.pos);
   }
 
-  // Mesh dirty chunks (budgeted)
+  // ---- upload changed chunk geometry to the GPU (budgeted) ----------------
+  // Only chunks the world reports as needing an upload are considered, instead
+  // of rescanning every loaded chunk every frame. At render distance 8 that is
+  // ~290 chunks, and the old full scan ran on all of them 60x a second.
   if (world && game.chunkRenderer) {
     let budget = game.settings.maxMeshPerFrame || 3;
-    for (const chunk of world.chunks.values()) {
-      if (budget <= 0) break;
-      if (chunk.meshed && chunk.meshData) {
-        // Check if this chunk's geometry needs to be uploaded (newly meshed or dirty)
-        const key = (chunk.cx & 0xffff) | ((chunk.cz & 0xffff) << 16);
-        const needsSync = !chunk._rendererSynced || chunk._syncGeneration !== chunk._meshGeneration;
-        if (needsSync) {
-          game.chunkRenderer.syncChunk(chunk, chunk.meshData);
-          chunk._rendererSynced = true;
-          chunk._syncGeneration = chunk._meshGeneration || 0;
-          budget--;
-        }
+    const pending = world.pendingUploads;
+    if (pending && pending.size) {
+      for (const chunk of pending) {
+        if (budget <= 0) break;
+        if (!chunk.meshed || !chunk.meshData) { pending.delete(chunk); continue; }
+        game.chunkRenderer.syncChunk(chunk, chunk.meshData);
+        chunk._rendererSynced = true;
+        chunk._syncGeneration = chunk._meshGeneration || 0;
+        pending.delete(chunk);
+        budget--;
       }
     }
   }
 
-  // Remove meshes for unloaded chunks
-  if (game.chunkRenderer) {
-    for (const [key, meshSet] of game.chunkRenderer._chunkMeshes) {
-      const cx = key & 0xffff;
-      const cz = (key >> 16) & 0xffff;
-      // Sign-extend 16-bit values
-      const scx = cx >= 0x8000 ? cx - 0x10000 : cx;
-      const scz = cz >= 0x8000 ? cz - 0x10000 : cz;
-      if (!world.getChunk(scx, scz)) {
-        game.chunkRenderer._removeChunkMeshes(key);
-      }
-    }
+  // Drop GPU meshes for chunks the world has unloaded. The world hands us the
+  // keys directly, so this no longer walks the whole mesh map each frame.
+  if (game.chunkRenderer && world && world.unloadedKeys && world.unloadedKeys.length) {
+    for (const key of world.unloadedKeys) game.chunkRenderer._removeChunkMeshes(key);
+    world.unloadedKeys.length = 0;
   }
 
   // Block breaking
@@ -618,21 +616,6 @@ function MAIN_gameUpdate(game, dt) {
     MAIN_updateAudio(game, dt);
   }
 
-  // Mark chunks dirty if world re-meshed them
-  if (world) {
-    for (const chunk of world.chunks.values()) {
-      if (chunk.meshed && chunk._meshGeneration === undefined) {
-        chunk._meshGeneration = 0;
-      }
-      if (chunk.meshed) {
-        // If chunk was freshly meshed this frame (dirty->clean transition)
-        if (!chunk._prevMeshed) {
-          chunk._meshGeneration = (chunk._meshGeneration || 0) + 1;
-        }
-        chunk._prevMeshed = true;
-      }
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,1 +1,7 @@
+# Node stub used only by the offline dev tools in tools/ — never shipped.
 node_modules/
+
+# Throwaway debugging harnesses.
+tools/scratch/
+
+*.log
