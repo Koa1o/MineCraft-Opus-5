@@ -51,6 +51,21 @@ const WORLD_DEFAULT_RENDER_DISTANCE = 8;
 const WORLD_DAY_LENGTH = 24000;
 const WORLD_PATH_NODE_BUDGET = 1500;   // A* nodes per tick across all mobs
 const WORLD_RANDOM_TICKS_PER_SECTION = 3;
+/**
+ * Chunks given random block ticks per world tick. The eligible set is walked
+ * round-robin, so every chunk is still reached regularly (81 chunks / 8 per tick
+ * = every ~0.5s at 20Hz) without spending the whole frame budget on it.
+ */
+const WORLD_RANDOM_TICK_CHUNKS_PER_TICK = 8;
+/**
+ * Wall-clock ceiling for the whole chunk-streaming pass, in milliseconds. Keeps
+ * a 60fps frame (16.7ms) intact even when a chunk is expensive: leftover work
+ * simply resumes on the next frame.
+ */
+const WORLD_STREAM_BUDGET_MS = 6;
+const WORLD_now = (typeof performance !== 'undefined' && performance.now)
+  ? () => performance.now()
+  : () => Date.now();
 const WORLD_ENTITY_HARD_CAP = 600;     // absolute safety cap on entity count
 
 // Ids that behave as projectiles rather than mobs.
@@ -165,6 +180,13 @@ export class World {
     this.tickAlpha = 0;
     /** Chunks needing a floating-fluid re-sweep once neighbours finish. */
     this._resweep = new Set();
+    /**
+     * Chunks whose geometry changed and must be re-uploaded to the GPU. The
+     * renderer drains this instead of rescanning every loaded chunk per frame.
+     */
+    this.pendingUploads = new Set();
+    /** Packed keys of chunks unloaded since the renderer last looked. */
+    this.unloadedKeys = [];
     this._accum = 0;
 
     // Position of the tracked player (used by weather / spawn / chunk loading).
@@ -213,6 +235,11 @@ export class World {
     // Drop block entities from the tick set.
     for (const be of c.blockEntities.values()) this._blockEntities.delete(be);
     this.chunks.delete(k);
+    this._resweep.delete(c);
+    this.pendingUploads.delete(c);
+    // Tell the renderer to release this chunk's GPU meshes. The key format
+    // matches the one ChunkRenderer uses internally.
+    this.unloadedKeys.push((cx & 0xffff) | ((cz & 0xffff) << 16));
     this.stats.unload++;
   }
 
@@ -965,6 +992,21 @@ export class World {
     let litBudget = this.settings.maxLightPerFrame;
     let meshBudget = this.settings.maxMeshPerFrame;
 
+    // Count budgets alone are not enough: a single dense chunk can take ~20ms
+    // to generate or mesh, so "3 chunks per frame" can blow a 16ms frame three
+    // times over. Cap the whole streaming pass by wall-clock time as well and
+    // resume next frame — this is what turns hitching into smooth streaming.
+    const timeBudgetMs = this.settings.streamBudgetMs || WORLD_STREAM_BUDGET_MS;
+    const startMs = WORLD_now();
+    const outOfTime = () => (WORLD_now() - startMs) >= timeBudgetMs;
+    // A single chunk can legitimately cost more than the whole frame budget
+    // (~10ms to mesh a dense one). So the rule is: always let the FIRST unit of
+    // work through to guarantee forward progress, then bail out of the entire
+    // pass as soon as the budget is gone. That converts a 3-chunk 30ms stall
+    // into one ~10ms step per frame.
+    let didWork = false;
+    const stop = () => didWork && outOfTime();
+
     // Walk nearest-first. Each chunk advances one stage per frame at most.
     for (const [ox, oz] of this._loadOrder) {
       const cx = pcx + ox, cz = pcz + oz;
@@ -973,7 +1015,9 @@ export class World {
       // Stage 1: terrain generation.
       if (!c.generated) {
         if (genBudget <= 0) continue;
+        if (stop()) break;
         this._generateChunk(c);
+        didWork = true;
         genBudget--;
         this.stats.gen++;
         continue;   // one stage per chunk per frame
@@ -984,7 +1028,9 @@ export class World {
       if (!c.populated) {
         if (!this._neighboursGenerated(cx, cz)) continue;
         if (decBudget <= 0) continue;
+        if (stop()) break;
         this._decorateChunk(c);
+        didWork = true;
         decBudget--;
         this.stats.decorate++;
         continue;
@@ -993,6 +1039,8 @@ export class World {
       // Stage 3: initial skylight flood.
       if (!c.lit) {
         if (litBudget <= 0) continue;
+        if (stop()) break;
+        didWork = true;
         this.lighting.initSkyLight(c);
         this.lighting.seedSkyBorders(c);
         this.lighting.flush();
@@ -1011,7 +1059,9 @@ export class World {
       }
       if (!c.meshed || c.dirty) {
         if (meshBudget <= 0) continue;
+        if (stop()) break;
         this._meshChunk(c);
+        didWork = true;
         meshBudget--;
         this.stats.mesh++;
         continue;
@@ -1046,11 +1096,12 @@ export class World {
 
     // Remesh any chunk marked dirty (e.g. by a lighting flush or block edit)
     // that is already fully set up but wasn't reached above, still budgeted.
-    if (meshBudget > 0) {
+    if (meshBudget > 0 && !stop()) {
       for (const c of this.chunks.values()) {
-        if (meshBudget <= 0) break;
+        if (meshBudget <= 0 || stop()) break;
         if (c.meshed && c.dirty && c.neighborsReady) {
           this._meshChunk(c);
+          didWork = true;
           meshBudget--;
           this.stats.mesh++;
         }
@@ -1131,6 +1182,12 @@ export class World {
     c.dirty = false;
     c.dirtySections.clear();
     c.faces = result ? result.faces : 0;
+    // Bump the generation counter so the renderer knows this chunk's geometry
+    // changed and re-uploads it. Without this a remesh (after breaking or
+    // placing a block, or a light update) never reaches the GPU and the world
+    // appears frozen.
+    c._meshGeneration = (c._meshGeneration || 0) + 1;
+    this.pendingUploads.add(c);
     return result;
   }
 
@@ -1206,17 +1263,47 @@ export class World {
     this._despawnPass();
   }
 
+  /**
+   * Random block ticks (crop growth, grass spread, leaf decay, fire, ice...).
+   *
+   * Ticking every nearby chunk every tick is what made this the single worst
+   * frame-time spike in the profile: at radius 4 that is 81 chunks x 8 sections
+   * x 3 positions = ~1900 dispatches per tick, 20 times a second. Instead we
+   * round-robin through the eligible chunks a few at a time, so the same ground
+   * still gets covered over a couple of seconds at a fraction of the cost per
+   * tick. Growth is a slow, probabilistic process, so this is invisible in play.
+   */
   _runRandomTicks() {
-    const R = this._registry, F = this._flags;
-    // Only tick chunks near the player to keep the cost bounded.
     const pcx = WORLD_floorDiv(Math.floor(this.playerPos.x), CHUNK_W);
     const pcz = WORLD_floorDiv(Math.floor(this.playerPos.z), CHUNK_W);
     const radius = Math.min(4, this.settings.renderDistance);
-    for (const c of this.chunks.values()) {
-      if (!c.generated) continue;
-      if (Math.abs(c.cx - pcx) > radius || Math.abs(c.cz - pcz) > radius) continue;
-      this.randomTick(c);
+
+    // Refresh the candidate list occasionally rather than every tick.
+    if (!this._rtList || this._rtRefresh <= 0
+        || this._rtCx !== pcx || this._rtCz !== pcz) {
+      this._rtList = [];
+      for (const c of this.chunks.values()) {
+        if (!c.generated) continue;
+        if (Math.abs(c.cx - pcx) > radius || Math.abs(c.cz - pcz) > radius) continue;
+        this._rtList.push(c);
+      }
+      this._rtRefresh = 40;          // rebuild at most every 2 seconds
+      this._rtCx = pcx; this._rtCz = pcz;
+      if (this._rtCursor === undefined || this._rtCursor >= this._rtList.length) {
+        this._rtCursor = 0;
+      }
     }
+    this._rtRefresh--;
+
+    const list = this._rtList;
+    if (!list.length) return;
+    const perTick = Math.min(WORLD_RANDOM_TICK_CHUNKS_PER_TICK, list.length);
+    for (let i = 0; i < perTick; i++) {
+      const c = list[this._rtCursor % list.length];
+      this._rtCursor++;
+      if (c && c.generated) this.randomTick(c);
+    }
+    if (this._rtCursor >= list.length) this._rtCursor = 0;
   }
 
   /** Fire WORLD_RANDOM_TICKS_PER_SECTION random positions per section. */

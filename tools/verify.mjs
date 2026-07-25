@@ -337,3 +337,21 @@ export async function checkDistInSync() {
     return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// (f) GLSL ES 1.00 conformance of every shader
+// ---------------------------------------------------------------------------
+export async function checkShaders() {
+  const { execFileSync } = await import('node:child_process');
+  console.log('\n--- (f) GLSL ES 1.00 shader lint ---');
+  try {
+    execFileSync(process.execPath, [new URL('glsl-lint.mjs', import.meta.url).pathname],
+      { encoding: 'utf8' });
+    console.log('PASS: all shaders are GLSL ES 1.00 conformant');
+    return true;
+  } catch (e) {
+    const out = ((e.stdout || '') + (e.stderr || '')).trim();
+    console.log('FAIL:\n' + out);
+    return false;
+  }
+}
