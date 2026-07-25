@@ -1,0 +1,7 @@
+{
+  "name": "minecraft-opus-5",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Voxel sandbox game. NOTE: this file exists ONLY so that Node-based dev tools in tools/ can import the ES modules in src/. The game itself needs no npm install, no build step and no server."
+}

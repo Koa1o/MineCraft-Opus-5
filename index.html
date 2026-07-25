@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Voxelcraft — Opus 5</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #0b0d10; color: #e6e6e6;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  #mc-root { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+
+  /* ---- boot / loading screen ---------------------------------------- */
+  #mc-boot {
+    position: fixed; inset: 0; z-index: 9999;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background:
+      radial-gradient(120% 80% at 50% 0%, #2b3d55 0%, #141a22 55%, #0b0d10 100%);
+    transition: opacity .5s ease;
+  }
+  #mc-boot.hidden { opacity: 0; pointer-events: none; }
+  #mc-boot h1 {
+    margin: 0 0 .35em; font-size: clamp(28px, 6vw, 58px); letter-spacing: .06em;
+    font-weight: 700; text-shadow: 0 3px 0 #1b2430, 0 6px 18px rgba(0,0,0,.6);
+  }
+  #mc-boot .sub { opacity: .62; font-size: 13px; letter-spacing: .18em; text-transform: uppercase; }
+  #mc-bar {
+    margin-top: 26px; width: min(420px, 74vw); height: 14px;
+    border: 2px solid #4a586b; background: #1b222c; padding: 2px;
+  }
+  #mc-bar > i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(#8bc34a, #5d9732); transition: width .25s ease;
+  }
+  #mc-status { margin-top: 12px; font-size: 12px; opacity: .75; min-height: 1.2em; }
+  #mc-hint {
+    margin-top: 34px; font-size: 12px; line-height: 1.9; opacity: .55; text-align: center;
+  }
+  #mc-hint b { color: #cfe3a3; font-weight: 600; }
+  #mc-error {
+    display: none; margin-top: 22px; max-width: min(620px, 88vw);
+    border: 1px solid #7a3b3b; background: #2a1a1a;
+    padding: 14px 16px; font-size: 12px; line-height: 1.6; color: #ffb9b9;
+    white-space: pre-wrap; text-align: left;
+  }
+  #mc-play {
+    margin-top: 30px; padding: 12px 34px; font: inherit; font-size: 15px;
+    letter-spacing: .1em; text-transform: uppercase; cursor: pointer;
+    color: #f2f7e8; background: #5d9732; border: 2px solid #3f6b21;
+    box-shadow: inset 0 -3px 0 rgba(0,0,0,.25);
+  }
+  #mc-play:hover { background: #6cad3b; }
+  #mc-play:active { transform: translateY(1px); }
+</style>
+
+<!--
+  Native ES modules + importmap. No bundler, no npm, no build step.
+  Three.js is pulled from the CDN on first load and then cached by the browser.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/examples/jsm/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="mc-root" data-mc-managed="1"></div>
+
+<div id="mc-boot">
+  <h1>VOXELCRAFT</h1>
+  <div class="sub">Opus 5 &middot; procedural voxel sandbox</div>
+  <div id="mc-bar"><i></i></div>
+  <div id="mc-status">initialising&hellip;</div>
+  <button id="mc-play" style="display:none">Play</button>
+  <div id="mc-hint">
+    <b>WASD</b> move &nbsp; <b>Space</b> jump &nbsp; <b>Shift</b> sneak &nbsp; <b>Ctrl</b> sprint<br>
+    <b>Left</b> mine &nbsp; <b>Right</b> place / use &nbsp; <b>1-9</b> hotbar &nbsp; <b>Wheel</b> cycle<br>
+    <b>E</b> inventory &nbsp; <b>Q</b> drop &nbsp; <b>F</b> creative &nbsp; <b>F3</b> debug &nbsp; <b>F5</b> view &nbsp; <b>Esc</b> pause
+  </div>
+  <div id="mc-error"></div>
+</div>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// Boot shim. Reports progress on the splash screen, surfaces the single most
+// common failure mode (opening this file straight from file:// in a browser
+// that blocks module loading) and points at dist/game.html in that case.
+// ---------------------------------------------------------------------------
+const bootEl = document.getElementById('mc-boot');
+const barEl = document.querySelector('#mc-bar > i');
+const statusEl = document.getElementById('mc-status');
+const errEl = document.getElementById('mc-error');
+const playEl = document.getElementById('mc-play');
+
+function progress(pct, msg) {
+  barEl.style.width = Math.round(pct * 100) + '%';
+  if (msg) statusEl.textContent = msg;
+}
+function fail(title, detail) {
+  statusEl.textContent = title;
+  errEl.style.display = 'block';
+  errEl.textContent = detail;
+}
+
+// file:// + module imports is blocked by some browsers. Detect and advise.
+if (location.protocol === 'file:') {
+  statusEl.textContent = 'running from file:// — if nothing loads, open dist/game.html instead';
+}
+
+window.addEventListener('error', (e) => {
+  fail('Startup failed', (e.message || 'unknown error') + '\n\n' +
+    (location.protocol === 'file:'
+      ? 'You are on file://. Some browsers refuse to load ES modules or the CDN from\n' +
+        'a local file. Open dist/game.html — it is the fully self-contained build\n' +
+        'with every module inlined.'
+      : 'Check the browser console for the full stack trace.'));
+});
+
+try {
+  progress(0.08, 'loading three.js from CDN…');
+  const THREE = await import('three');
+  progress(0.30, 'building texture atlas…');
+  const { Game } = await import('./src/main.js');
+  progress(0.55, 'generating world…');
+
+  const game = new Game(document.getElementById('mc-root'), {
+    autoEnter: false,
+    onProgress: (p, m) => progress(0.30 + p * 0.70, m),
+  });
+  window.game = game;
+  await game.start();
+  progress(1, 'ready');
+
+  // Pointer lock needs a user gesture, so gate the actual entry on a click.
+  playEl.style.display = 'inline-block';
+  statusEl.textContent = 'click Play to lock the mouse';
+  playEl.addEventListener('click', () => {
+    bootEl.classList.add('hidden');
+    setTimeout(() => { bootEl.style.display = 'none'; }, 520);
+    game.enter();
+  }, { once: true });
+} catch (err) {
+  fail('Startup failed', (err && (err.stack || err.message) || String(err)) + '\n\n' +
+    (location.protocol === 'file:'
+      ? 'You are on file://. Open dist/game.html — the self-contained build.'
+      : ''));
+  throw err;
+}
+</script>
+</body>
+</html>
