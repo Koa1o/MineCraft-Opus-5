@@ -34,6 +34,17 @@ const PLAYER_STEP_HEIGHT = 0.6;
 
 const PLAYER_GRAVITY = 0.08;
 const PLAYER_AIR_FRICTION = 0.91;
+const PLAYER_TICKS_PER_SECOND = 20;
+/** Water physics. Drag is multiplicative per tick. */
+const PLAYER_WATER_DRAG = 0.8;
+/** Upward impulse per tick while holding jump. MUST exceed PLAYER_GRAVITY
+ * (0.08) or the player can never rise and gets stuck underwater. */
+const PLAYER_SWIM_UP = 0.092;
+/** Passive drift with no vertical input: just below gravity, so you sink
+ * slowly rather than being pinned to the bottom. */
+const PLAYER_WATER_BUOYANCY = 0.048;
+/** Cap on sink speed so the player is never pinned to the bottom. */
+const PLAYER_WATER_MAX_SINK = 0.12;
 const PLAYER_GROUND_FRICTION = 0.6;
 /** Fraction of ground acceleration available while airborne. */
 const PLAYER_AIR_CONTROL = 0.22;
@@ -87,16 +98,29 @@ function PLAYER_toolKindMatches(tool, blockToolType) {
   return kind === blockToolType;
 }
 
+/**
+ * Fraction of a block broken PER SECOND.
+ *
+ * Minecraft's rule: damage per tick = speed / (hardness * 30) when the tool can
+ * harvest, or speed / (hardness * 100) when it cannot. Multiply by 20 ticks to
+ * get a per-second rate, which the caller then scales by real elapsed time — so
+ * mining takes the same wall-clock time regardless of framerate. The previous
+ * version returned a per-CALL amount and was applied once per frame, making a
+ * 144Hz machine mine 2.4x faster than a 60Hz one, and its x5 penalty on top of
+ * hardness*30 put stone-by-hand at ~37 seconds.
+ */
 function PLAYER_computeBreakSpeed(tool, blockDef) {
   if (!blockDef || blockDef.hardness < 0) return 0; // unbreakable
   const hardness = blockDef.hardness;
-  if (hardness === 0) return 1;
+  if (hardness === 0) return Infinity;              // instant
   const toolKindOk = PLAYER_toolKindMatches(tool, blockDef.tool);
   const speed = toolKindOk ? PLAYER_toolSpeed(tool) : 1;
-  const harvestOk = toolKindOk && (PLAYER_toolHarvestLevel(tool) >= (blockDef.harvestLevel || 0));
-  // If requiresTool and tool can't harvest: 1/30 penalty on top
-  const penalty = (blockDef.requiresTool && !harvestOk) ? 5 : 1;
-  return speed / (hardness * 30 * penalty);
+  const harvestOk = toolKindOk
+    && (PLAYER_toolHarvestLevel(tool) >= (blockDef.harvestLevel || 0));
+  // Cannot harvest -> 100 instead of 30 (Minecraft's own factor).
+  const divisor = harvestOk ? 30 : 100;
+  const perTick = speed / (hardness * divisor);
+  return perTick * PLAYER_TICKS_PER_SECOND;
 }
 
 // Face offsets: +X -X +Y -Y +Z -Z
@@ -424,9 +448,13 @@ export class Player extends Entity {
     }
 
     const tool = PLAYER_toolForHeldItem(this.inventory);
-    const speed = PLAYER_computeBreakSpeed(tool, blockDef);
+    const ratePerSecond = PLAYER_computeBreakSpeed(tool, blockDef);
+    if (ratePerSecond <= 0) return;                 // unbreakable
 
-    this.breakProgress += speed;
+    // dt is in SECONDS here (the controller passes the frame delta), so the
+    // rate is time-based and mining speed is framerate-independent.
+    const seconds = (typeof dt === 'number' && dt > 0) ? Math.min(dt, 0.25) : 1 / 60;
+    this.breakProgress += ratePerSecond === Infinity ? 1 : ratePerSecond * seconds;
     this.breakStage = Math.min(9, Math.floor(this.breakProgress * 10));
 
     this._addExhaustion(PLAYER_EXHAUSTION_MINE);
@@ -864,13 +892,38 @@ export class Player extends Entity {
     // Water physics
     if (this.inWater && !this.isFlying) {
       this.isSwimming = true;
-      const swimDir = mlen > 0.01 ? this.pitch : 0;
-      this.vel.x += mx * PLAYER_SWIM_SPEED * 0.05;
-      this.vel.z += mz * PLAYER_SWIM_SPEED * 0.05;
-      this.vel.y += 0.04; // buoyancy
-      this.vel.x *= 0.8;
-      this.vel.y *= 0.8;
-      this.vel.z *= 0.8;
+
+      // Horizontal swimming. As with walking, drag is multiplicative, so the
+      // acceleration has to be solved against it or the player barely moves
+      // (0.4 blocks/s with the old 5% figure, versus ~2.0 in Minecraft).
+      const swimAccel = PLAYER_SWIM_SPEED * (1 - PLAYER_WATER_DRAG) / PLAYER_WATER_DRAG;
+      this.vel.x += mx * swimAccel;
+      this.vel.z += mz * swimAccel;
+
+      // Vertical. Buoyancy alone (0.04) never beat gravity (0.08), so the
+      // equilibrium was -0.16 blocks/tick: the player sank and had no way back
+      // up, which is exactly the "fall in water and get stuck" report. Holding
+      // jump now swims upward, and looking up while swimming forward also lifts
+      // you, the same as vanilla.
+      if (input.jump) {
+        this.vel.y += PLAYER_SWIM_UP;
+      } else if (mlen > 0.01 && this.pitch < -0.15) {
+        // Pointing upward while swimming forward gives a gentler climb.
+        this.vel.y += PLAYER_SWIM_UP * 0.55;
+      } else if (input.sneak) {
+        this.vel.y -= PLAYER_SWIM_UP * 0.6;   // dive
+      } else {
+        this.vel.y += PLAYER_WATER_BUOYANCY;  // slowly bob toward the surface
+      }
+
+      this.vel.x *= PLAYER_WATER_DRAG;
+      this.vel.y *= PLAYER_WATER_DRAG;
+      this.vel.z *= PLAYER_WATER_DRAG;
+      // Never sink faster than a gentle drift; prevents being pinned to the bed.
+      if (this.vel.y < -PLAYER_WATER_MAX_SINK) this.vel.y = -PLAYER_WATER_MAX_SINK;
+      // Water cancels accumulated fall damage.
+      this._fallDistance = 0;
+      this._fallY = null;
 
       // Oxygen
       const eyeY = this.pos.y + this.eyeHeight;

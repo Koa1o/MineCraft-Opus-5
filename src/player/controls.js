@@ -26,121 +26,100 @@ const CTRL_FACE_NORMALS = [
 // DDA voxel raycast
 // ---------------------------------------------------------------------------
 
+/**
+ * Voxel DDA raycast against block shapes.
+ *
+ * Two bugs lived here and between them made block targeting fail outright:
+ *  - Shape boxes were read as arrays (`s[0]`, `s[3]`), but src/world/shapes.js
+ *    returns objects `{x0,y0,z0,x1,y1,z1}`. Every value was undefined, so no
+ *    slab, stair, torch, fence or chest could ever be hit.
+ *  - The hit was only accepted when `hitDist !== dist || face >= 0`. On the very
+ *    first voxel (the one the eye is already inside or adjacent to) face is -1
+ *    and hitDist equals dist, so valid hits were discarded.
+ *
+ * @returns {{x,y,z,face,point,dist,blockId}|null}
+ */
 function CTRL_raycastDDA(world, ox, oy, oz, dx, dy, dz, maxDist, registry) {
-  // Normalise direction
   const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
   if (len < 1e-9) return null;
   const rdx = dx / len, rdy = dy / len, rdz = dz / len;
 
-  let ix = Math.floor(ox);
-  let iy = Math.floor(oy);
-  let iz = Math.floor(oz);
-
+  let ix = Math.floor(ox), iy = Math.floor(oy), iz = Math.floor(oz);
   const stepX = rdx >= 0 ? 1 : -1;
   const stepY = rdy >= 0 ? 1 : -1;
   const stepZ = rdz >= 0 ? 1 : -1;
 
-  const tDeltaX = Math.abs(1 / rdx);
-  const tDeltaY = Math.abs(1 / rdy);
-  const tDeltaZ = Math.abs(1 / rdz);
+  const tDeltaX = Math.abs(rdx) < 1e-9 ? Infinity : Math.abs(1 / rdx);
+  const tDeltaY = Math.abs(rdy) < 1e-9 ? Infinity : Math.abs(1 / rdy);
+  const tDeltaZ = Math.abs(rdz) < 1e-9 ? Infinity : Math.abs(1 / rdz);
 
-  let tMaxX = Math.abs(rdx) < 1e-9 ? Infinity : (rdx >= 0 ? (Math.ceil(ox) - ox) : (ox - Math.floor(ox))) / Math.abs(rdx);
-  let tMaxY = Math.abs(rdy) < 1e-9 ? Infinity : (rdy >= 0 ? (Math.ceil(oy) - oy) : (oy - Math.floor(oy))) / Math.abs(rdy);
-  let tMaxZ = Math.abs(rdz) < 1e-9 ? Infinity : (rdz >= 0 ? (Math.ceil(oz) - oz) : (oz - Math.floor(oz))) / Math.abs(rdz);
+  let tMaxX = Math.abs(rdx) < 1e-9 ? Infinity
+    : (rdx >= 0 ? (Math.floor(ox) + 1 - ox) : (ox - Math.floor(ox))) / Math.abs(rdx);
+  let tMaxY = Math.abs(rdy) < 1e-9 ? Infinity
+    : (rdy >= 0 ? (Math.floor(oy) + 1 - oy) : (oy - Math.floor(oy))) / Math.abs(rdy);
+  let tMaxZ = Math.abs(rdz) < 1e-9 ? Infinity
+    : (rdz >= 0 ? (Math.floor(oz) + 1 - oz) : (oz - Math.floor(oz))) / Math.abs(rdz);
 
   let face = -1;
   let dist = 0;
-
-  const MAX_STEPS = Math.ceil(maxDist) * 3 + 10;
+  const MAX_STEPS = Math.ceil(maxDist) * 3 + 12;
 
   for (let step = 0; step < MAX_STEPS; step++) {
-    // Test current voxel
     const blockId = world.getBlock(ix, iy, iz);
     if (blockId) {
-      const blockDef = registry ? registry.def(blockId) : null;
-      const solid = blockDef ? blockDef.solid : true;
-      const interactable = blockDef ? (!!blockDef.interact) : false;
-      const collidable = blockDef ? (blockDef.collides !== false && solid) : true;
+      const def = registry ? registry.def(blockId) : null;
+      // Fluids and replaceable plants are see-through for targeting; everything
+      // solid or interactable can be hit.
+      const isFluid = def ? !!def.fluid : false;
+      const solid = def ? def.solid !== false : true;
+      const interactable = def ? !!def.interact : false;
+      const climbable = def ? !!def.climbable : false;
+      const targetable = !isFluid && (solid || interactable || climbable);
 
-      if (collidable || interactable) {
-        // Fine-grained hit test against block shape boxes
-        let hitDist = dist;
-        let hitFace = face;
+      if (targetable) {
+        const boxes = (def && def.shape && def.shape.length)
+          ? def.shape
+          : [{ x0: 0, y0: 0, z0: 0, x1: 1, y1: 1, z1: 1 }];
 
-        if (blockDef && blockDef.shape && blockDef.shape.length > 0) {
-          // Sub-box test
-          let bestT = Infinity;
-          let bestFace = face;
-          for (const s of blockDef.shape) {
-            const bx = ix + s[0], by = iy + s[1], bz = iz + s[2];
-            const ex = ix + s[3], ey = iy + s[4], ez = iz + s[5];
-            const t = CTRL_rayAabb(ox, oy, oz, rdx, rdy, rdz,
-              { minX: bx, minY: by, minZ: bz, maxX: ex, maxY: ey, maxZ: ez });
-            if (t !== null && t < bestT && t <= maxDist) {
-              bestT = t;
-              // Determine face from normal at intersection
-              const hx = ox + rdx * t;
-              const hy = oy + rdy * t;
-              const hz = oz + rdz * t;
-              bestFace = CTRL_faceFromHit(hx, hy, hz, bx, by, bz, ex, ey, ez);
-            }
-          }
-          if (bestT < Infinity) {
-            hitDist = bestT;
-            hitFace = bestFace;
-          } else {
-            // No sub-box hit, skip
-            // Continue DDA step
-          }
-        } else {
-          // Full cube test
-          const t = CTRL_rayAabb(ox, oy, oz, rdx, rdy, rdz,
-            { minX: ix, minY: iy, minZ: iz, maxX: ix + 1, maxY: iy + 1, maxZ: iz + 1 });
-          if (t !== null && t <= maxDist) {
-            hitDist = t;
-            hitFace = face;
+        let bestT = Infinity;
+        let bestFace = -1;
+        for (const b of boxes) {
+          const aabb = {
+            minX: ix + b.x0, minY: iy + b.y0, minZ: iz + b.z0,
+            maxX: ix + b.x1, maxY: iy + b.y1, maxZ: iz + b.z1,
+          };
+          const t = CTRL_rayAabb(ox, oy, oz, rdx, rdy, rdz, aabb);
+          if (t !== null && t <= maxDist && t < bestT) {
+            bestT = t;
+            const hx = ox + rdx * t, hy = oy + rdy * t, hz = oz + rdz * t;
+            bestFace = CTRL_faceFromHit(hx, hy, hz,
+              aabb.minX, aabb.minY, aabb.minZ, aabb.maxX, aabb.maxY, aabb.maxZ);
           }
         }
-
-        if (hitDist !== dist || face >= 0) {
-          const hx = ox + rdx * hitDist;
-          const hy = oy + rdy * hitDist;
-          const hz = oz + rdz * hitDist;
+        if (bestT < Infinity) {
           return {
             x: ix, y: iy, z: iz,
-            face: hitFace >= 0 ? hitFace : face,
-            point: { x: hx, y: hy, z: hz },
-            dist: hitDist,
+            face: bestFace >= 0 ? bestFace : (face >= 0 ? face : 2),
+            point: { x: ox + rdx * bestT, y: oy + rdy * bestT, z: oz + rdz * bestT },
+            dist: bestT,
             blockId,
           };
         }
       }
     }
 
-    // Advance DDA
-    if (tMaxX < tMaxY && tMaxX < tMaxZ) {
-      dist = tMaxX;
-      if (dist > maxDist) break;
-      ix += stepX;
-      face = stepX > 0 ? 1 : 0; // entered from -X or +X
-      tMaxX += tDeltaX;
-    } else if (tMaxY < tMaxZ) {
-      dist = tMaxY;
-      if (dist > maxDist) break;
-      iy += stepY;
-      face = stepY > 0 ? 3 : 2; // entered from -Y or +Y
-      tMaxY += tDeltaY;
+    // Advance one voxel along the cheapest axis.
+    if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
+      dist = tMaxX; if (dist > maxDist) break;
+      ix += stepX; face = stepX > 0 ? 1 : 0; tMaxX += tDeltaX;
+    } else if (tMaxY <= tMaxZ) {
+      dist = tMaxY; if (dist > maxDist) break;
+      iy += stepY; face = stepY > 0 ? 3 : 2; tMaxY += tDeltaY;
     } else {
-      dist = tMaxZ;
-      if (dist > maxDist) break;
-      iz += stepZ;
-      face = stepZ > 0 ? 5 : 4; // entered from -Z or +Z
-      tMaxZ += tDeltaZ;
+      dist = tMaxZ; if (dist > maxDist) break;
+      iz += stepZ; face = stepZ > 0 ? 5 : 4; tMaxZ += tDeltaZ;
     }
-
-    if (dist > maxDist) break;
   }
-
   return null;
 }
 

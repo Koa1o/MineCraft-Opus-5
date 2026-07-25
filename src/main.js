@@ -650,59 +650,51 @@ function MAIN_gameUpdate(game, dt) {
 // ---------------------------------------------------------------------------
 // Block breaking with crack overlay
 // ---------------------------------------------------------------------------
+/**
+ * Visual feedback for the targeted block: selection wireframe + crack overlay.
+ *
+ * This used to run a SECOND, independent breaking simulation here (its own
+ * progress counter, its own world.breakBlock call) while PlayerControls ran the
+ * real one — and it read `controls.targetBlock`, `controls.mining` and
+ * `controls.isBreaking`, none of which exist (the getter is `controls.target`).
+ * So the wireframe and the crack overlay never appeared, and the two systems
+ * could disagree about what was being mined. It now purely reflects the player's
+ * actual breaking state; PlayerControls owns the mining logic.
+ */
 function MAIN_updateBreaking(game, dt) {
   const controls = game._controls;
-  const world = game.world;
   const player = game.player;
-  if (!controls || !world || !player) return;
+  if (!controls || !player) return;
 
-  const target = controls.targetBlock || null;
+  const target = controls.target || null;
 
-  if (target) {
-    // Show selection box
-    if (game._selectionBox) {
+  // ---- selection wireframe
+  if (game._selectionBox) {
+    if (target) {
       game._selectionBox.position.set(target.x + 0.5, target.y + 0.5, target.z + 0.5);
       game._selectionBox.visible = true;
+    } else {
+      game._selectionBox.visible = false;
     }
+  }
 
-    // Breaking progress
-    const isSameTarget = game._lastTarget &&
-      game._lastTarget.x === target.x &&
-      game._lastTarget.y === target.y &&
-      game._lastTarget.z === target.z;
-
-    if (controls.mining && controls.isBreaking) {
-      if (!isSameTarget) game._breakProgress = 0;
-      const blockId = world.getBlock(target.x, target.y, target.z);
-      const def = world.registry && world.registry.def ? world.registry.def(blockId) : null;
-      const hardness = def ? (def.hardness || 1) : 1;
-      if (hardness >= 0) {
-        game._breakProgress += dt / Math.max(0.05, hardness * 1.5);
-      }
-
-      const stage = Math.min(9, Math.floor(game._breakProgress * 10));
-      if (game._crackMesh && game._crackTextures) {
-        game._crackMesh.visible = true;
-        game._crackMesh.position.set(target.x + 0.5, target.y + 0.5, target.z + 0.5);
-        game._crackMesh.material.uniforms.uTex.value = game._crackTextures[stage];
-      }
-
-      if (game._breakProgress >= 1) {
-        world.breakBlock(target.x, target.y, target.z, { tool: player.getHeldTool && player.getHeldTool() });
-        game._breakProgress = 0;
-        if (game._crackMesh) game._crackMesh.visible = false;
+  // ---- crack overlay, driven by the player's real break progress
+  const breaking = player.breakingBlock;
+  if (game._crackMesh) {
+    if (breaking && game._crackTextures && player.breakProgress > 0) {
+      const stage = Math.max(0, Math.min(9, Math.floor(player.breakProgress * 10)));
+      game._crackMesh.visible = true;
+      game._crackMesh.position.set(breaking.x + 0.5, breaking.y + 0.5, breaking.z + 0.5);
+      const tex = game._crackTextures[stage];
+      if (tex && game._crackMesh.material && game._crackMesh.material.uniforms) {
+        game._crackMesh.material.uniforms.uTex.value = tex;
       }
     } else {
-      game._breakProgress = 0;
-      if (game._crackMesh) game._crackMesh.visible = false;
+      game._crackMesh.visible = false;
     }
-    game._lastTarget = { x: target.x, y: target.y, z: target.z };
-  } else {
-    if (game._selectionBox) game._selectionBox.visible = false;
-    if (game._crackMesh) game._crackMesh.visible = false;
-    game._breakProgress = 0;
-    game._lastTarget = null;
   }
+
+  game._lastTarget = target ? { x: target.x, y: target.y, z: target.z } : null;
 }
 
 // ---------------------------------------------------------------------------
